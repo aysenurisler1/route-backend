@@ -18,6 +18,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // Tabloları otomatik oluştur
 async function initDB() {
   try {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
