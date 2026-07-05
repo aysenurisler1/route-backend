@@ -10,25 +10,48 @@ const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
   : true;
 
-app.use(cors({
-  origin: allowedOrigins,
-  credentials: true
-}));
-
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json({ limit: "10mb" }));
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// Tabloları otomatik oluştur
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS routes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id INTEGER REFERENCES users(id),
+        name VARCHAR(200),
+        route_json JSONB,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS driver_locations (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER,
+        latitude DOUBLE PRECISION,
+        longitude DOUBLE PRECISION,
+        recorded_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    console.log("Veritabanı tabloları hazır");
+  } catch (err) {
+    console.error("DB init hatası:", err.message);
+  }
+}
+
+initDB();
 
 function parseRouteJson(value) {
   if (!value) return {};
   if (typeof value === "string") {
-    try {
-      return JSON.parse(value);
-    } catch (_) {
-      return {};
-    }
+    try { return JSON.parse(value); } catch (_) { return {}; }
   }
   return value;
 }
@@ -50,7 +73,6 @@ app.get("/", (req, res) => {
   res.json({ message: "Rota360 backend çalışıyor", version: "1.1.0" });
 });
 
-// Kullanıcı oluşturma
 app.post("/register", async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -65,7 +87,6 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// Rota ekleme
 app.post("/routes", async (req, res) => {
   const { user_id, name, route_json } = req.body;
   if (!user_id || !route_json) {
@@ -91,7 +112,6 @@ app.post("/routes", async (req, res) => {
   }
 });
 
-// Kullanıcının rotalarını getir
 app.get("/routes/:user_id", async (req, res) => {
   const { user_id } = req.params;
   try {
@@ -106,7 +126,6 @@ app.get("/routes/:user_id", async (req, res) => {
   }
 });
 
-// Aktif rota
 app.get("/routes/:user_id/active", async (req, res) => {
   const { user_id } = req.params;
   try {
@@ -124,7 +143,6 @@ app.get("/routes/:user_id/active", async (req, res) => {
   }
 });
 
-// Durak tamamlandı
 app.patch("/routes/:route_id/stops/:stop_id/complete", async (req, res) => {
   const { route_id, stop_id } = req.params;
   const { completed = true } = req.body;
@@ -166,7 +184,6 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", async (req, res) => {
   }
 });
 
-// Kullanıcı giriş
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -189,20 +206,10 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// Sürücü konumu güncelle
 app.post("/drivers/:user_id/location", async (req, res) => {
   const { user_id } = req.params;
   const { latitude, longitude } = req.body;
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS driver_locations (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        latitude DOUBLE PRECISION,
-        longitude DOUBLE PRECISION,
-        recorded_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
     await pool.query(
       "INSERT INTO driver_locations (user_id, latitude, longitude) VALUES ($1, $2, $3)",
       [user_id, latitude, longitude]
@@ -214,7 +221,6 @@ app.post("/drivers/:user_id/location", async (req, res) => {
   }
 });
 
-// Sürücünün son konumu
 app.get("/drivers/:user_id/location", async (req, res) => {
   const { user_id } = req.params;
   try {
