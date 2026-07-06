@@ -6,16 +6,11 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
-  : true;
-
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// Tabloları otomatik oluştur
 async function initDB() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
@@ -41,16 +36,6 @@ async function initDB() {
         recorded_at TIMESTAMP DEFAULT NOW()
       );
     `);
-    await pool.query("ALTER TABLE routes ADD COLUMN IF NOT EXISTS vehicle_id INTEGER");
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS fleet_state (
-        user_id INTEGER NOT NULL,
-        vehicle_id INTEGER NOT NULL,
-        workspace JSONB NOT NULL DEFAULT '{}'::jsonb,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        PRIMARY KEY (user_id, vehicle_id)
-      );
-    `);
     console.log("Veritabanı tabloları hazır");
   } catch (err) {
     console.error("DB init hatası:", err.message);
@@ -72,7 +57,6 @@ function normalizeRoute(row) {
   return {
     id: row.id,
     user_id: row.user_id,
-    vehicle_id: row.vehicle_id,
     name: row.name,
     created_at: row.created_at,
     updated_at: routeJson.updatedAt || routeJson.updated_at || row.created_at,
@@ -100,7 +84,7 @@ app.post("/register", async (req, res) => {
 });
 
 app.post("/routes", async (req, res) => {
-  const { user_id, name, route_json, vehicle_id } = req.body;
+  const { user_id, name, route_json } = req.body;
   if (!user_id || !route_json) {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
   }
@@ -112,14 +96,10 @@ app.post("/routes", async (req, res) => {
     createdAt: parsedRouteJson.createdAt || now,
     updatedAt: now,
   };
-
-  const vehicleIdValue =
-    vehicle_id === undefined || vehicle_id === null ? null : Number(vehicle_id);
-
   try {
     const result = await pool.query(
-      "INSERT INTO routes (id, user_id, name, route_json, vehicle_id) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING *",
-      [user_id, name || "Rota360 Rota", normalizedRouteJson, vehicleIdValue]
+      "INSERT INTO routes (id, user_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
+      [user_id, name || "Rota360 Rota", normalizedRouteJson]
     );
     res.status(201).json({ message: "Rota kaydedildi", route: normalizeRoute(result.rows[0]) });
   } catch (err) {
@@ -130,20 +110,11 @@ app.post("/routes", async (req, res) => {
 
 app.get("/routes/:user_id", async (req, res) => {
   const { user_id } = req.params;
-  const { vehicle_id } = req.query;
-
   try {
-    const result =
-      vehicle_id === undefined
-        ? await pool.query(
-            "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC",
-            [user_id]
-          )
-        : await pool.query(
-            "SELECT * FROM routes WHERE user_id = $1 AND vehicle_id = $2 ORDER BY created_at DESC",
-            [user_id, Number(vehicle_id)]
-          );
-
+    const result = await pool.query(
+      "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC",
+      [user_id]
+    );
     res.json(result.rows.map(normalizeRoute));
   } catch (err) {
     console.log(err);
@@ -151,23 +122,13 @@ app.get("/routes/:user_id", async (req, res) => {
   }
 });
 
-// Mobilin kullanacağı aktif rota: şimdilik en son oluşturulan rota (opsiyonel vehicle_id filtresiyle)
 app.get("/routes/:user_id/active", async (req, res) => {
   const { user_id } = req.params;
-  const { vehicle_id } = req.query;
-
   try {
-    const result =
-      vehicle_id === undefined
-        ? await pool.query(
-            "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
-            [user_id]
-          )
-        : await pool.query(
-            "SELECT * FROM routes WHERE user_id = $1 AND vehicle_id = $2 ORDER BY created_at DESC LIMIT 1",
-            [user_id, Number(vehicle_id)]
-          );
-
+    const result = await pool.query(
+      "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [user_id]
+    );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Aktif rota bulunamadı" });
     }
@@ -178,61 +139,6 @@ app.get("/routes/:user_id/active", async (req, res) => {
   }
 });
 
-// Masaüstünden gelen filo (araç bazlı çalışma alanı) durumunu kaydet
-app.post("/fleet/:user_id", async (req, res) => {
-  const { user_id } = req.params;
-  const { vehicles } = req.body;
-
-  if (!vehicles || typeof vehicles !== "object") {
-    return res.status(400).json({ error: "vehicles zorunlu" });
-  }
-
-  try {
-    await Promise.all(
-      Object.entries(vehicles).map(([vehicleId, workspace]) =>
-        pool.query(
-          `INSERT INTO fleet_state (user_id, vehicle_id, workspace, updated_at)
-           VALUES ($1, $2, $3, now())
-           ON CONFLICT (user_id, vehicle_id)
-           DO UPDATE SET workspace = $3, updated_at = now()`,
-          [user_id, Number(vehicleId), workspace || {}]
-        )
-      )
-    );
-
-    res.json({ message: "Filo durumu kaydedildi" });
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: "Hata oluştu" });
-  }
-});
-
-// Mobilin araç seçiciyle okuyacağı filo durumu (tüm araçlar)
-app.get("/fleet/:user_id", async (req, res) => {
-  const { user_id } = req.params;
-
-  try {
-    const result = await pool.query(
-      "SELECT vehicle_id, workspace, updated_at FROM fleet_state WHERE user_id = $1",
-      [user_id]
-    );
-
-    const vehicles = {};
-    for (const row of result.rows) {
-      vehicles[row.vehicle_id] = {
-        workspace: row.workspace,
-        updatedAt: row.updated_at,
-      };
-    }
-
-    res.json({ vehicles });
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: "Hata oluştu" });
-  }
-});
-
-// Mobilde adres tamamlandı bilgisini kaydetme
 app.patch("/routes/:route_id/stops/:stop_id/complete", async (req, res) => {
   const { route_id, stop_id } = req.params;
   const { completed = true } = req.body;
