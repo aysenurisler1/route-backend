@@ -234,6 +234,51 @@ app.get("/drivers/:user_id/location", async (req, res) => {
   }
 });
 
+// ── Rota optimizasyonu (en kısa güzergah sıralaması - Google Directions API)
+app.post("/routes/optimize", async (req, res) => {
+  const { origin, stops } = req.body;
+  // origin: { latitude, longitude }
+  // stops: [{ id, latitude, longitude, ... }, ...]
+
+  if (!origin || !stops || stops.length === 0) {
+    return res.status(400).json({ error: "origin ve stops gerekli" });
+  }
+
+  try {
+    const waypoints = stops.map(s => `${s.latitude},${s.longitude}`).join("|");
+    const url = `https://maps.googleapis.com/maps/api/directions/json` +
+      `?origin=${origin.latitude},${origin.longitude}` +
+      `&destination=${origin.latitude},${origin.longitude}` +
+      `&waypoints=optimize:true|${waypoints}` +
+      `&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.status !== "OK") {
+      console.error("Directions API hatası:", data.status, data.error_message);
+      return res.status(500).json({ error: "Google Maps rota hesaplayamadı", detail: data.status });
+    }
+
+    const optimizedOrder = data.routes[0].waypoint_order; // örn: [2,0,3,1]
+    const totalDistanceMeters = data.routes[0].legs.reduce((sum, leg) => sum + leg.distance.value, 0);
+    const totalDurationSeconds = data.routes[0].legs.reduce((sum, leg) => sum + leg.duration.value, 0);
+
+    // stops dizisini optimize edilmiş sıraya göre yeniden diz
+    const reorderedStops = optimizedOrder.map(i => stops[i]);
+
+    res.json({
+      optimizedOrder,
+      reorderedStops,
+      totalDistanceKm: (totalDistanceMeters / 1000).toFixed(1),
+      totalDurationMin: Math.round(totalDurationSeconds / 60),
+    });
+  } catch (err) {
+    console.error("Optimize hatası:", err);
+    res.status(500).json({ error: "Rota optimizasyonu başarısız" });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server ${PORT} portunda çalışıyor`);
