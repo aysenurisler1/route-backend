@@ -45,18 +45,22 @@ async function initDB() {
         email VARCHAR(255),
         reset_code VARCHAR(10),
         reset_code_expires TIMESTAMP,
+        vehicle_id INTEGER,
         created_at TIMESTAMP DEFAULT NOW()
       );
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(10);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_expires TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
       CREATE TABLE IF NOT EXISTS routes (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id INTEGER REFERENCES users(id),
+        vehicle_id INTEGER,
         name VARCHAR(200),
         route_json JSONB,
         created_at TIMESTAMP DEFAULT NOW()
       );
+      ALTER TABLE routes ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
       CREATE TABLE IF NOT EXISTS driver_locations (
         id SERIAL PRIMARY KEY,
         user_id INTEGER,
@@ -86,6 +90,7 @@ function normalizeRoute(row) {
   return {
     id: row.id,
     user_id: row.user_id,
+    vehicle_id: row.vehicle_id,
     name: row.name,
     created_at: row.created_at,
     updated_at: routeJson.updatedAt || routeJson.updated_at || row.created_at,
@@ -95,7 +100,7 @@ function normalizeRoute(row) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ message: "Rota360 backend çalışıyor", version: "1.1.0" });
+  res.json({ message: "Rota360 backend çalışıyor", version: "1.2.0" });
 });
 
 app.post("/register", async (req, res) => {
@@ -112,23 +117,60 @@ app.post("/register", async (req, res) => {
   }
 });
 
+// ── Araç Atama (Yönetim) ──────────────────────────────────────────────
+// Bir kullanıcıyı (personeli) belirli bir araca atar. vehicle_id null
+// gönderilirse atama kaldırılır.
+app.post("/users/:user_id/assign-vehicle", async (req, res) => {
+  const { user_id } = req.params;
+  const { vehicle_id } = req.body;
+  try {
+    const result = await pool.query(
+      "UPDATE users SET vehicle_id = $1 WHERE id = $2 RETURNING id, username, vehicle_id",
+      [vehicle_id ?? null, user_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+    }
+    res.json({ message: "Araç ataması güncellendi", user: result.rows[0] });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
+// Tüm personel hesaplarını (şifre bilgisi olmadan) listeler — masaüstünde
+// "bu araca kim atanacak" seçimi için kullanılır.
+app.get("/users/drivers", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, username, vehicle_id FROM users ORDER BY username"
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 app.post("/routes", async (req, res) => {
-  const { user_id, name, route_json } = req.body;
+  const { user_id, name, route_json, vehicle_id } = req.body;
   if (!user_id || !route_json) {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
   }
   const now = new Date().toISOString();
   const parsedRouteJson = parseRouteJson(route_json);
+  const resolvedVehicleId = vehicle_id ?? parsedRouteJson.vehicleId ?? null;
   const normalizedRouteJson = {
     ...parsedRouteJson,
+    vehicleId: resolvedVehicleId,
     status: parsedRouteJson.status || "active",
     createdAt: parsedRouteJson.createdAt || now,
     updatedAt: now,
   };
   try {
     const result = await pool.query(
-      "INSERT INTO routes (id, user_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
-      [user_id, name || "Rota360 Rota", normalizedRouteJson]
+      "INSERT INTO routes (id, user_id, vehicle_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING *",
+      [user_id, resolvedVehicleId, name || "Rota360 Rota", normalizedRouteJson]
     );
     res.status(201).json({ message: "Rota kaydedildi", route: normalizeRoute(result.rows[0]) });
   } catch (err) {
@@ -160,6 +202,26 @@ app.get("/routes/:user_id/active", async (req, res) => {
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Aktif rota bulunamadı" });
+    }
+    res.json(normalizeRoute(result.rows[0]));
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
+// ── Araç Bazlı Aktif Rota ──────────────────────────────────────────────
+// Personel kendi hesabıyla giriş yapar, ama gördüğü rota onun kendi
+// oluşturduğu değil, ATANDIĞI ARACA en son kaydedilen rotadır.
+app.get("/vehicles/:vehicle_id/active-route", async (req, res) => {
+  const { vehicle_id } = req.params;
+  try {
+    const result = await pool.query(
+      "SELECT * FROM routes WHERE vehicle_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [vehicle_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Bu araca atanmış aktif rota bulunamadı" });
     }
     res.json(normalizeRoute(result.rows[0]));
   } catch (err) {
@@ -291,7 +353,12 @@ app.post("/login", async (req, res) => {
     if (!passwordCheck.rows[0].match) {
       return res.status(401).json({ error: "Şifre hatalı" });
     }
-    res.json({ message: "Giriş başarılı", user_id: user.id, username: user.username });
+    res.json({
+      message: "Giriş başarılı",
+      user_id: user.id,
+      username: user.username,
+      vehicle_id: user.vehicle_id,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Sunucu hatası" });
