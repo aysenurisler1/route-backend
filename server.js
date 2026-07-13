@@ -3,18 +3,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
-const nodemailer = require("nodemailer");
-
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  family: 4,
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-});
 
 const app = express();
 
@@ -22,6 +10,29 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// E-posta gönderimi için Resend API kullanılıyor (HTTP üzerinden, 443 portu —
+// Render'ın ücretsiz planında SMTP portları (465/587) engellendiği için).
+async function sendResetEmail(toEmail, code) {
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "Rota360 <onboarding@resend.dev>",
+      to: [toEmail],
+      subject: "Rota360 Şifre Sıfırlama Kodu",
+      text: `Şifrenizi sıfırlamak için kodunuz: ${code}\nBu kod 15 dakika geçerlidir.`,
+    }),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Resend API hatası: ${response.status} - ${errBody}`);
+  }
+}
 
 async function initDB() {
   try {
@@ -221,12 +232,7 @@ app.post("/forgot-password", async (req, res) => {
       [email, code, expires, username]
     );
 
-    await transporter.sendMail({
-      from: `"Rota360" <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject: "Rota360 Şifre Sıfırlama Kodu",
-      text: `Şifrenizi sıfırlamak için kodunuz: ${code}\nBu kod 15 dakika geçerlidir.`,
-    });
+    await sendResetEmail(email, code);
 
     res.json({ message: "Doğrulama kodu e-posta adresinize gönderildi" });
   } catch (err) {
