@@ -3,6 +3,15 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const nodemailer = require("nodemailer");
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD,
+  },
+});
 
 const app = express();
 
@@ -19,6 +28,9 @@ async function initDB() {
         id SERIAL PRIMARY KEY,
         username VARCHAR(100) UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
+        email VARCHAR(255),
+        reset_code VARCHAR(10),
+        reset_code_expires TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS routes (
@@ -177,6 +189,78 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", async (req, res) => {
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
+// ── Şifremi Unuttum: doğrulama kodu gönder ────────────────────────────
+app.post("/forgot-password", async (req, res) => {
+  const { username, email } = req.body;
+  if (!username || !email) {
+    return res.status(400).json({ error: "Kullanıcı adı ve e-posta gerekli" });
+  }
+  try {
+    const result = await pool.query(
+      "SELECT * FROM users WHERE username = $1",
+      [username]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 dakika geçerli
+
+    await pool.query(
+      "UPDATE users SET email = $1, reset_code = $2, reset_code_expires = $3 WHERE username = $4",
+      [email, code, expires, username]
+    );
+
+    await transporter.sendMail({
+      from: `"Rota360" <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject: "Rota360 Şifre Sıfırlama Kodu",
+      text: `Şifrenizi sıfırlamak için kodunuz: ${code}\nBu kod 15 dakika geçerlidir.`,
+    });
+
+    res.json({ message: "Doğrulama kodu e-posta adresinize gönderildi" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Kod gönderilemedi" });
+  }
+});
+
+// ── Şifremi Unuttum: kodu doğrula ve şifreyi değiştir ─────────────────
+app.post("/reset-password", async (req, res) => {
+  const { username, code, newPassword } = req.body;
+  if (!username || !code || !newPassword) {
+    return res.status(400).json({ error: "Tüm alanlar gerekli" });
+  }
+  try {
+    const result = await pool.query(
+      "SELECT * FROM users WHERE username = $1",
+      [username]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+    }
+    const user = result.rows[0];
+
+    if (user.reset_code !== code) {
+      return res.status(400).json({ error: "Kod hatalı" });
+    }
+    if (!user.reset_code_expires || new Date() > new Date(user.reset_code_expires)) {
+      return res.status(400).json({ error: "Kodun süresi dolmuş, tekrar isteyin" });
+    }
+
+    await pool.query(
+      "UPDATE users SET password_hash = crypt($1, gen_salt('bf')), reset_code = NULL, reset_code_expires = NULL WHERE username = $2",
+      [newPassword, username]
+    );
+
+    res.json({ message: "Şifreniz başarıyla güncellendi" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Şifre güncellenemedi" });
   }
 });
 
