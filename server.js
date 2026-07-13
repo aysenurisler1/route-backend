@@ -33,6 +33,18 @@ async function initDB() {
         reset_code_expires TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        email VARCHAR(255),
+        reset_code VARCHAR(10),
+        reset_code_expires TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(10);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_expires TIMESTAMP;
       CREATE TABLE IF NOT EXISTS routes (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id INTEGER REFERENCES users(id),
