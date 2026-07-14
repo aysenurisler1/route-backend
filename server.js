@@ -3,6 +3,14 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const admin = require("firebase-admin");
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+if (serviceAccount.project_id) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
 
 const app = express();
 
@@ -51,6 +59,8 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_expires TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;
       UPDATE users SET role = 'driver' WHERE username IN ('nehir', 'reviewer') AND role IS NULL;
       CREATE TABLE IF NOT EXISTS routes (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -152,6 +162,21 @@ app.get("/users/drivers", async (req, res) => {
   }
 });
 
+app.post("/users/:user_id/fcm-token", async (req, res) => {
+  const { user_id } = req.params;
+  const { fcm_token } = req.body;
+  try {
+    await pool.query("UPDATE users SET fcm_token = $1 WHERE id = $2", [
+      fcm_token,
+      user_id,
+    ]);
+    res.json({ message: "Bildirim token'ı kaydedildi" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 app.post("/routes", async (req, res) => {
   const { user_id, name, route_json, vehicle_id } = req.body;
   if (!user_id || !route_json) {
@@ -168,10 +193,31 @@ app.post("/routes", async (req, res) => {
     updatedAt: now,
   };
   try {
-    const result = await pool.query(
+   const result = await pool.query(
       "INSERT INTO routes (id, user_id, vehicle_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING *",
       [user_id, resolvedVehicleId, name || "Rota360 Rota", normalizedRouteJson]
     );
+
+    if (resolvedVehicleId !== null) {
+      try {
+        const driverResult = await pool.query(
+          "SELECT fcm_token FROM users WHERE vehicle_id = $1 AND fcm_token IS NOT NULL",
+          [resolvedVehicleId]
+        );
+        for (const row of driverResult.rows) {
+          await admin.messaging().send({
+            token: row.fcm_token,
+            notification: {
+              title: "Yeni Rota Atandı",
+              body: `Araç ${resolvedVehicleId + 1} için yeni bir rota oluşturuldu.`,
+            },
+          });
+        }
+      } catch (notifErr) {
+        console.log("Bildirim gönderilemedi:", notifErr.message);
+      }
+    }
+
     res.status(201).json({ message: "Rota kaydedildi", route: normalizeRoute(result.rows[0]) });
   } catch (err) {
     console.log(err);
