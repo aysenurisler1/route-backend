@@ -11,8 +11,6 @@ app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// E-posta gönderimi için Resend API kullanılıyor (HTTP üzerinden, 443 portu —
-// Render'ın ücretsiz planında SMTP portları (465/587) engellendiği için).
 async function sendResetEmail(toEmail, code) {
   const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -100,7 +98,7 @@ function normalizeRoute(row) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ message: "Rota360 backend çalışıyor", version: "1.2.0" });
+  res.json({ message: "Rota360 backend çalışıyor", version: "1.3.0" });
 });
 
 app.post("/register", async (req, res) => {
@@ -117,9 +115,6 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// ── Araç Atama (Yönetim) ──────────────────────────────────────────────
-// Bir kullanıcıyı (personeli) belirli bir araca atar. vehicle_id null
-// gönderilirse atama kaldırılır.
 app.post("/users/:user_id/assign-vehicle", async (req, res) => {
   const { user_id } = req.params;
   const { vehicle_id } = req.body;
@@ -138,8 +133,6 @@ app.post("/users/:user_id/assign-vehicle", async (req, res) => {
   }
 });
 
-// Tüm personel hesaplarını (şifre bilgisi olmadan) listeler — masaüstünde
-// "bu araca kim atanacak" seçimi için kullanılır.
 app.get("/users/drivers", async (req, res) => {
   try {
     const result = await pool.query(
@@ -210,9 +203,6 @@ app.get("/routes/:user_id/active", async (req, res) => {
   }
 });
 
-// ── Araç Bazlı Aktif Rota ──────────────────────────────────────────────
-// Personel kendi hesabıyla giriş yapar, ama gördüğü rota onun kendi
-// oluşturduğu değil, ATANDIĞI ARACA en son kaydedilen rotadır.
 app.get("/vehicles/:vehicle_id/active-route", async (req, res) => {
   const { vehicle_id } = req.params;
   try {
@@ -271,7 +261,6 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", async (req, res) => {
   }
 });
 
-// ── Şifremi Unuttum: doğrulama kodu gönder ────────────────────────────
 app.post("/forgot-password", async (req, res) => {
   const { username, email } = req.body;
   if (!username || !email) {
@@ -287,7 +276,7 @@ app.post("/forgot-password", async (req, res) => {
     }
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 dakika geçerli
+    const expires = new Date(Date.now() + 15 * 60 * 1000);
 
     await pool.query(
       "UPDATE users SET email = $1, reset_code = $2, reset_code_expires = $3 WHERE username = $4",
@@ -303,7 +292,6 @@ app.post("/forgot-password", async (req, res) => {
   }
 });
 
-// ── Şifremi Unuttum: kodu doğrula ve şifreyi değiştir ─────────────────
 app.post("/reset-password", async (req, res) => {
   const { username, code, newPassword } = req.body;
   if (!username || !code || !newPassword) {
@@ -397,44 +385,140 @@ app.get("/drivers/:user_id/location", async (req, res) => {
   }
 });
 
-// ── Rota optimizasyonu (en kısa güzergah sıralaması - Google Directions API)
+// ── Exact TSP (Held-Karp) — veri kaynağından bağımsız ─────────────────
+// cost: NxN süre matrisi (saniye), node 0 = sabit başlangıç/bitiş.
+// Masaüstündeki Dart _tsp.solveExact() ile birebir aynı algoritma.
+function solveExactTsp(cost) {
+  const n = cost.length;
+  const m = n - 1;
+  if (m <= 0) return { order: [], totalCost: 0 };
+  if (m === 1) return { order: [1], totalCost: cost[0][1] + cost[1][0] };
+
+  const FULL = 1 << m;
+  const dp = Array.from({ length: FULL }, () => new Array(m).fill(Infinity));
+  const parent = Array.from({ length: FULL }, () => new Array(m).fill(-1));
+
+  for (let i = 0; i < m; i++) {
+    dp[1 << i][i] = cost[0][i + 1];
+  }
+
+  for (let mask = 1; mask < FULL; mask++) {
+    for (let i = 0; i < m; i++) {
+      if (!(mask & (1 << i))) continue;
+      const current = dp[mask][i];
+      if (current === Infinity) continue;
+      for (let j = 0; j < m; j++) {
+        if (mask & (1 << j)) continue;
+        const nextMask = mask | (1 << j);
+        const candidate = current + cost[i + 1][j + 1];
+        if (candidate < dp[nextMask][j]) {
+          dp[nextMask][j] = candidate;
+          parent[nextMask][j] = i;
+        }
+      }
+    }
+  }
+
+  const fullMask = FULL - 1;
+  let best = Infinity;
+  let bestLast = -1;
+  for (let i = 0; i < m; i++) {
+    const candidate = dp[fullMask][i] + cost[i + 1][0];
+    if (candidate < best) {
+      best = candidate;
+      bestLast = i;
+    }
+  }
+
+  const order = [];
+  let mask = fullMask;
+  let last = bestLast;
+  while (last !== -1) {
+    order.push(last);
+    const prevLast = parent[mask][last];
+    mask ^= 1 << last;
+    last = prevLast;
+  }
+  order.reverse();
+
+  return { order: order.map((i) => i + 1), totalCost: best };
+}
+
+// ── Google Distance Matrix (trafik dahil) ile NxN süre/mesafe matrisi ──
+async function fetchGoogleMatrix(nodes) {
+  const coordStr = nodes.map((n) => `${n.latitude},${n.longitude}`).join("|");
+  const url =
+    `https://maps.googleapis.com/maps/api/distancematrix/json` +
+    `?origins=${encodeURIComponent(coordStr)}` +
+    `&destinations=${encodeURIComponent(coordStr)}` +
+    `&departure_time=now` +
+    `&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+
+  const response = await fetch(url);
+  const data = await response.json();
+
+  if (data.status !== "OK") {
+    throw new Error(`Google Distance Matrix hatası: ${data.status}`);
+  }
+
+  const n = nodes.length;
+  const durations = Array.from({ length: n }, () => new Array(n).fill(null));
+  const distances = Array.from({ length: n }, () => new Array(n).fill(null));
+
+  for (let i = 0; i < n; i++) {
+    const elements = data.rows[i].elements;
+    for (let j = 0; j < n; j++) {
+      const el = elements[j];
+      if (el.status !== "OK") continue;
+      // Trafik verisi varsa onu kullan, yoksa normal süreye düş.
+      durations[i][j] = el.duration_in_traffic
+        ? el.duration_in_traffic.value
+        : el.duration.value;
+      distances[i][j] = el.distance.value;
+    }
+  }
+
+  return { durations, distances };
+}
+
+// ── Rota optimizasyonu: Google trafik verisi + exact TSP ──────────────
 app.post("/routes/optimize", async (req, res) => {
   const { origin, stops } = req.body;
-  // origin: { latitude, longitude }
-  // stops: [{ id, latitude, longitude, ... }, ...]
 
   if (!origin || !stops || stops.length === 0) {
     return res.status(400).json({ error: "origin ve stops gerekli" });
   }
 
   try {
-    const waypoints = stops.map(s => `${s.latitude},${s.longitude}`).join("|");
-    const url = `https://maps.googleapis.com/maps/api/directions/json` +
-      `?origin=${origin.latitude},${origin.longitude}` +
-      `&destination=${origin.latitude},${origin.longitude}` +
-      `&waypoints=optimize:true|${waypoints}` +
-      `&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+    const nodes = [
+      { latitude: origin.latitude, longitude: origin.longitude },
+      ...stops.map((s) => ({ latitude: s.latitude, longitude: s.longitude })),
+    ];
 
-    const response = await fetch(url);
-    const data = await response.json();
+    const { durations, distances } = await fetchGoogleMatrix(nodes);
 
-    if (data.status !== "OK") {
-      console.error("Directions API hatası:", data.status, data.error_message);
-      return res.status(500).json({ error: "Google Maps rota hesaplayamadı", detail: data.status });
+    const cost = durations.map((row) =>
+      row.map((v) => (v === null ? 1e15 : v))
+    );
+
+    const { order, totalCost } = solveExactTsp(cost);
+
+    const optimizedOrder = order.map((nodeIdx) => nodeIdx - 1);
+    const reorderedStops = optimizedOrder.map((i) => stops[i]);
+
+    let totalDistanceMeters = 0;
+    let prev = 0;
+    for (const nodeIdx of order) {
+      totalDistanceMeters += distances[prev][nodeIdx] ?? 0;
+      prev = nodeIdx;
     }
-
-    const optimizedOrder = data.routes[0].waypoint_order; // örn: [2,0,3,1]
-    const totalDistanceMeters = data.routes[0].legs.reduce((sum, leg) => sum + leg.distance.value, 0);
-    const totalDurationSeconds = data.routes[0].legs.reduce((sum, leg) => sum + leg.duration.value, 0);
-
-    // stops dizisini optimize edilmiş sıraya göre yeniden diz
-    const reorderedStops = optimizedOrder.map(i => stops[i]);
+    totalDistanceMeters += distances[prev][0] ?? 0;
 
     res.json({
       optimizedOrder,
       reorderedStops,
       totalDistanceKm: (totalDistanceMeters / 1000).toFixed(1),
-      totalDurationMin: Math.round(totalDurationSeconds / 60),
+      totalDurationMin: Math.round(totalCost / 60),
     });
   } catch (err) {
     console.error("Optimize hatası:", err);
