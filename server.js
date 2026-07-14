@@ -50,6 +50,8 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(10);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_expires TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20);
+      UPDATE users SET role = 'driver' WHERE username IN ('nehir', 'reviewer') AND role IS NULL;
       CREATE TABLE IF NOT EXISTS routes (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id INTEGER REFERENCES users(id),
@@ -102,11 +104,11 @@ app.get("/", (req, res) => {
 });
 
 app.post("/register", async (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, role } = req.body;
   try {
     await pool.query(
-      "INSERT INTO users (username, password_hash) VALUES ($1, crypt($2, gen_salt('bf')))",
-      [username, password]
+      "INSERT INTO users (username, password_hash, role) VALUES ($1, crypt($2, gen_salt('bf')), $3)",
+      [username, password, role || "driver"]
     );
     res.json({ message: "Kullanıcı oluşturuldu" });
   } catch (err) {
@@ -136,7 +138,7 @@ app.post("/users/:user_id/assign-vehicle", async (req, res) => {
 app.get("/users/drivers", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, username, vehicle_id FROM users ORDER BY username"
+      "SELECT id, username, vehicle_id FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
     );
     res.json(result.rows);
   } catch (err) {
@@ -346,6 +348,7 @@ app.post("/login", async (req, res) => {
       user_id: user.id,
       username: user.username,
       vehicle_id: user.vehicle_id,
+      role: user.role,
     });
   } catch (err) {
     console.error(err);
