@@ -68,6 +68,11 @@ async function initDB() {
         longitude DOUBLE PRECISION,
         recorded_at TIMESTAMP DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS fleet_workspace (
+        singleton_id INTEGER PRIMARY KEY DEFAULT 1,
+        vehicles JSONB,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
     `);
     console.log("Veritabanı tabloları hazır");
   } catch (err) {
@@ -385,6 +390,46 @@ app.get("/drivers/:user_id/location", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Konum alınamadı" });
+  }
+});
+
+// ── Filo çalışma alanı (fleet workspace) ──────────────────────────────
+// Tüm araçların (Araç 1-5) sabit ev adresi, kuyruktan düşürülen adresler
+// gibi bilgilerini tutan TEK, PAYLAŞILAN bir kayıt. :user_id parametresi
+// (geriye dönük uyumluluk için URL'de duruyor ama) kullanılmıyor —
+// çünkü bu veri kullanıcıya değil, araç filosunun tamamına ait.
+app.post("/fleet/:user_id", async (req, res) => {
+  const { vehicles } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO fleet_workspace (singleton_id, vehicles, updated_at)
+       VALUES (1, $1, NOW())
+       ON CONFLICT (singleton_id)
+       DO UPDATE SET vehicles = $1, updated_at = NOW()`,
+      [vehicles]
+    );
+    res.json({ message: "Filo bilgisi kaydedildi" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Filo bilgisi kaydedilemedi" });
+  }
+});
+
+app.get("/fleet/:user_id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT vehicles, updated_at FROM fleet_workspace WHERE singleton_id = 1"
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Filo bilgisi bulunamadı" });
+    }
+    res.json({
+      vehicles: result.rows[0].vehicles,
+      updatedAt: result.rows[0].updated_at,
+    });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Filo bilgisi alınamadı" });
   }
 });
 
