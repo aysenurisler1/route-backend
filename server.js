@@ -3,13 +3,16 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
-const admin = require("firebase-admin");
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getMessaging } = require("firebase-admin/messaging");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+let messaging = null;
 if (serviceAccount.project_id) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+  const firebaseApp = initializeApp({
+    credential: cert(serviceAccount),
   });
+  messaging = getMessaging(firebaseApp);
 }
 
 const app = express();
@@ -198,14 +201,14 @@ app.post("/routes", async (req, res) => {
       [user_id, resolvedVehicleId, name || "Rota360 Rota", normalizedRouteJson]
     );
 
-    if (resolvedVehicleId !== null) {
+    if (resolvedVehicleId !== null && messaging) {
       try {
         const driverResult = await pool.query(
           "SELECT fcm_token FROM users WHERE vehicle_id = $1 AND fcm_token IS NOT NULL",
           [resolvedVehicleId]
         );
         for (const row of driverResult.rows) {
-          await admin.messaging().send({
+          await messaging.send({
             token: row.fcm_token,
             notification: {
               title: "Yeni Rota Atandı",
