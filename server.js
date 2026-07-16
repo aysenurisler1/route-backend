@@ -23,29 +23,6 @@ if (serviceAccount.project_id) {
   messaging = getMessaging(firebaseApp);
 }
 
-// E-posta gönderimi için Resend API kullanılıyor (HTTP üzerinden, 443 portu —
-// Render'ın ücretsiz planında SMTP portları (465/587) engellendiği için).
-async function sendResetEmail(toEmail, code) {
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: "Rota360 <onboarding@resend.dev>",
-      to: [toEmail],
-      subject: "Rota360 Şifre Sıfırlama Kodu",
-      text: `Şifrenizi sıfırlamak için kodunuz: ${code}\nBu kod 15 dakika geçerlidir.`,
-    }),
-  });
-
-  if (!response.ok) {
-    const errBody = await response.text();
-    throw new Error(`Resend API hatası: ${response.status} - ${errBody}`);
-  }
-}
-
 async function initDB() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
@@ -119,8 +96,6 @@ function normalizeRoute(row) {
 }
 
 // ── JWT Doğrulama Middleware ───────────────────────────────────────────
-// Gelen isteğin "Authorization: Bearer <token>" başlığını kontrol eder.
-// Token geçerliyse req.user'a kullanıcı bilgisini ekler, geçersizse 401/403 döner.
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -139,15 +114,15 @@ function authenticateToken(req, res, next) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ message: "Rota360 backend çalışıyor", version: "1.4.0" });
+  res.json({ message: "Rota360 backend çalışıyor", version: "1.5.0" });
 });
 
 app.post("/register", async (req, res) => {
-  const { username, password, role } = req.body;
+  const { username, password, role, email } = req.body;
   try {
     await pool.query(
-      "INSERT INTO users (username, password_hash, role) VALUES ($1, crypt($2, gen_salt('bf')), $3)",
-      [username, password, role || "driver"]
+      "INSERT INTO users (username, password_hash, role, email) VALUES ($1, crypt($2, gen_salt('bf')), $3, $4)",
+      [username, password, role || "driver", email || null]
     );
     res.json({ message: "Kullanıcı oluşturuldu" });
   } catch (err) {
@@ -183,6 +158,29 @@ app.get("/users/drivers", authenticateToken, async (req, res) => {
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
+// Yönetici (dispatcher), giriş yapmış personelin şifresini sıfırlar.
+// E-posta gerektirmez — sadece giriş yapmış (token'lı) biri çağırabilir.
+app.post("/users/:user_id/admin-reset-password", authenticateToken, async (req, res) => {
+  const { user_id } = req.params;
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: "Yeni şifre en az 6 karakter olmalı" });
+  }
+  try {
+    const result = await pool.query(
+      "UPDATE users SET password_hash = crypt($1, gen_salt('bf')) WHERE id = $2 RETURNING username",
+      [newPassword, user_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+    }
+    res.json({ message: `${result.rows[0].username} kullanıcısının şifresi sıfırlandı` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Şifre sıfırlanamadı" });
   }
 });
 
@@ -370,71 +368,6 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "Hata oluştu" });
-  }
-});
-
-app.post("/forgot-password", async (req, res) => {
-  const { username, email } = req.body;
-  if (!username || !email) {
-    return res.status(400).json({ error: "Kullanıcı adı ve e-posta gerekli" });
-  }
-  try {
-    const result = await pool.query(
-      "SELECT * FROM users WHERE username = $1",
-      [username]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
-    }
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = new Date(Date.now() + 15 * 60 * 1000);
-
-    await pool.query(
-      "UPDATE users SET email = $1, reset_code = $2, reset_code_expires = $3 WHERE username = $4",
-      [email, code, expires, username]
-    );
-
-    await sendResetEmail(email, code);
-
-    res.json({ message: "Doğrulama kodu e-posta adresinize gönderildi" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Kod gönderilemedi" });
-  }
-});
-
-app.post("/reset-password", async (req, res) => {
-  const { username, code, newPassword } = req.body;
-  if (!username || !code || !newPassword) {
-    return res.status(400).json({ error: "Tüm alanlar gerekli" });
-  }
-  try {
-    const result = await pool.query(
-      "SELECT * FROM users WHERE username = $1",
-      [username]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
-    }
-    const user = result.rows[0];
-
-    if (user.reset_code !== code) {
-      return res.status(400).json({ error: "Kod hatalı" });
-    }
-    if (!user.reset_code_expires || new Date() > new Date(user.reset_code_expires)) {
-      return res.status(400).json({ error: "Kodun süresi dolmuş, tekrar isteyin" });
-    }
-
-    await pool.query(
-      "UPDATE users SET password_hash = crypt($1, gen_salt('bf')), reset_code = NULL, reset_code_expires = NULL WHERE username = $2",
-      [newPassword, username]
-    );
-
-    res.json({ message: "Şifreniz başarıyla güncellendi" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Şifre güncellenemedi" });
   }
 });
 
