@@ -76,6 +76,7 @@ async function initDB() {
     console.log("Veritabanı tabloları hazır");
   } catch (err) {
     console.error("DB init hatası:", err.message);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
   }
 }
 
@@ -135,6 +136,7 @@ app.post("/register", async (req, res) => {
     res.json({ message: "Kullanıcı oluşturuldu" });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -153,6 +155,7 @@ app.post("/users/:user_id/assign-vehicle", authenticateToken, async (req, res) =
     res.json({ message: "Araç ataması güncellendi", user: result.rows[0] });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -165,6 +168,7 @@ app.get("/users/drivers", authenticateToken, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -188,6 +192,7 @@ app.post("/users/:user_id/admin-reset-password", authenticateToken, async (req, 
     res.json({ message: `${result.rows[0].username} kullanıcısının şifresi sıfırlandı` });
   } catch (err) {
     console.error(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Şifre sıfırlanamadı" });
   }
 });
@@ -203,6 +208,7 @@ app.post("/users/:user_id/fcm-token", authenticateToken, async (req, res) => {
     res.json({ message: "Bildirim token'ı kaydedildi" });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -245,12 +251,14 @@ app.post("/routes", authenticateToken, async (req, res) => {
         }
       } catch (notifErr) {
         console.log("Bildirim gönderilemedi:", notifErr.message);
+        if (process.env.SENTRY_DSN) Sentry.captureException(notifErr);
       }
     }
 
     res.status(201).json({ message: "Rota kaydedildi", route: normalizeRoute(result.rows[0]) });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -265,6 +273,7 @@ app.get("/routes/:user_id", authenticateToken, async (req, res) => {
     res.json(result.rows.map(normalizeRoute));
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -282,6 +291,7 @@ app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
     res.json(normalizeRoute(result.rows[0]));
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -299,6 +309,7 @@ app.get("/vehicles/:vehicle_id/active-route", authenticateToken, async (req, res
     res.json(normalizeRoute(result.rows[0]));
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -316,6 +327,7 @@ app.post("/fleet/:user_id", authenticateToken, async (req, res) => {
     res.json({ message: "Filo bilgisi kaydedildi" });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Filo bilgisi kaydedilemedi" });
   }
 });
@@ -334,6 +346,7 @@ app.get("/fleet/:user_id", authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Filo bilgisi alınamadı" });
   }
 });
@@ -375,6 +388,7 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
     res.json({ message: "Durak güncellendi", route: normalizeRoute(updateResult.rows[0]) });
   } catch (err) {
     console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
   }
 });
@@ -411,6 +425,7 @@ app.post("/login", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Sunucu hatası" });
   }
 });
@@ -426,6 +441,7 @@ app.post("/drivers/:user_id/location", authenticateToken, async (req, res) => {
     res.json({ message: "Konum güncellendi" });
   } catch (err) {
     console.error(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Konum güncellenemedi" });
   }
 });
@@ -443,6 +459,7 @@ app.get("/drivers/:user_id/location", authenticateToken, async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Konum alınamadı" });
   }
 });
@@ -579,6 +596,7 @@ app.post("/routes/optimize", authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error("Optimize hatası:", err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Rota optimizasyonu başarısız" });
   }
 });
