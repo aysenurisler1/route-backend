@@ -3,8 +3,16 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const jwt = require("jsonwebtoken");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
 let messaging = null;
@@ -15,13 +23,8 @@ if (serviceAccount.project_id) {
   messaging = getMessaging(firebaseApp);
 }
 
-const app = express();
-
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
-
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-
+// E-posta gönderimi için Resend API kullanılıyor (HTTP üzerinden, 443 portu —
+// Render'ın ücretsiz planında SMTP portları (465/587) engellendiği için).
 async function sendResetEmail(toEmail, code) {
   const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -62,9 +65,7 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code_expires TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20);
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;
-      UPDATE users SET role = 'driver' WHERE username IN ('nehir', 'reviewer') AND role IS NULL;
       CREATE TABLE IF NOT EXISTS routes (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id INTEGER REFERENCES users(id),
@@ -117,8 +118,28 @@ function normalizeRoute(row) {
   };
 }
 
+// ── JWT Doğrulama Middleware ───────────────────────────────────────────
+// Gelen isteğin "Authorization: Bearer <token>" başlığını kontrol eder.
+// Token geçerliyse req.user'a kullanıcı bilgisini ekler, geçersizse 401/403 döner.
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ error: "Giriş yapmanız gerekiyor" });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş" });
+    }
+    req.user = user;
+    next();
+  });
+}
+
 app.get("/", (req, res) => {
-  res.json({ message: "Rota360 backend çalışıyor", version: "1.3.0" });
+  res.json({ message: "Rota360 backend çalışıyor", version: "1.4.0" });
 });
 
 app.post("/register", async (req, res) => {
@@ -135,7 +156,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-app.post("/users/:user_id/assign-vehicle", async (req, res) => {
+app.post("/users/:user_id/assign-vehicle", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   const { vehicle_id } = req.body;
   try {
@@ -153,7 +174,7 @@ app.post("/users/:user_id/assign-vehicle", async (req, res) => {
   }
 });
 
-app.get("/users/drivers", async (req, res) => {
+app.get("/users/drivers", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT id, username, vehicle_id FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
@@ -165,7 +186,7 @@ app.get("/users/drivers", async (req, res) => {
   }
 });
 
-app.post("/users/:user_id/fcm-token", async (req, res) => {
+app.post("/users/:user_id/fcm-token", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   const { fcm_token } = req.body;
   try {
@@ -180,7 +201,7 @@ app.post("/users/:user_id/fcm-token", async (req, res) => {
   }
 });
 
-app.post("/routes", async (req, res) => {
+app.post("/routes", authenticateToken, async (req, res) => {
   const { user_id, name, route_json, vehicle_id } = req.body;
   if (!user_id || !route_json) {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
@@ -196,7 +217,7 @@ app.post("/routes", async (req, res) => {
     updatedAt: now,
   };
   try {
-   const result = await pool.query(
+    const result = await pool.query(
       "INSERT INTO routes (id, user_id, vehicle_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING *",
       [user_id, resolvedVehicleId, name || "Rota360 Rota", normalizedRouteJson]
     );
@@ -228,7 +249,7 @@ app.post("/routes", async (req, res) => {
   }
 });
 
-app.get("/routes/:user_id", async (req, res) => {
+app.get("/routes/:user_id", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   try {
     const result = await pool.query(
@@ -242,7 +263,7 @@ app.get("/routes/:user_id", async (req, res) => {
   }
 });
 
-app.get("/routes/:user_id/active", async (req, res) => {
+app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   try {
     const result = await pool.query(
@@ -259,7 +280,7 @@ app.get("/routes/:user_id/active", async (req, res) => {
   }
 });
 
-app.get("/vehicles/:vehicle_id/active-route", async (req, res) => {
+app.get("/vehicles/:vehicle_id/active-route", authenticateToken, async (req, res) => {
   const { vehicle_id } = req.params;
   try {
     const result = await pool.query(
@@ -276,7 +297,42 @@ app.get("/vehicles/:vehicle_id/active-route", async (req, res) => {
   }
 });
 
-app.patch("/routes/:route_id/stops/:stop_id/complete", async (req, res) => {
+app.post("/fleet/:user_id", authenticateToken, async (req, res) => {
+  const { vehicles } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO fleet_workspace (singleton_id, vehicles, updated_at)
+       VALUES (1, $1, NOW())
+       ON CONFLICT (singleton_id)
+       DO UPDATE SET vehicles = $1, updated_at = NOW()`,
+      [vehicles]
+    );
+    res.json({ message: "Filo bilgisi kaydedildi" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Filo bilgisi kaydedilemedi" });
+  }
+});
+
+app.get("/fleet/:user_id", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT vehicles, updated_at FROM fleet_workspace WHERE singleton_id = 1"
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Filo bilgisi bulunamadı" });
+    }
+    res.json({
+      vehicles: result.rows[0].vehicles,
+      updatedAt: result.rows[0].updated_at,
+    });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Filo bilgisi alınamadı" });
+  }
+});
+
+app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async (req, res) => {
   const { route_id, stop_id } = req.params;
   const { completed = true } = req.body;
   try {
@@ -397,12 +453,20 @@ app.post("/login", async (req, res) => {
     if (!passwordCheck.rows[0].match) {
       return res.status(401).json({ error: "Şifre hatalı" });
     }
+
+    const token = jwt.sign(
+      { user_id: user.id, username: user.username, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
     res.json({
       message: "Giriş başarılı",
       user_id: user.id,
       username: user.username,
       vehicle_id: user.vehicle_id,
       role: user.role,
+      token: token,
     });
   } catch (err) {
     console.error(err);
@@ -410,7 +474,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.post("/drivers/:user_id/location", async (req, res) => {
+app.post("/drivers/:user_id/location", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   const { latitude, longitude } = req.body;
   try {
@@ -425,7 +489,7 @@ app.post("/drivers/:user_id/location", async (req, res) => {
   }
 });
 
-app.get("/drivers/:user_id/location", async (req, res) => {
+app.get("/drivers/:user_id/location", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   try {
     const result = await pool.query(
@@ -442,49 +506,7 @@ app.get("/drivers/:user_id/location", async (req, res) => {
   }
 });
 
-// ── Filo çalışma alanı (fleet workspace) ──────────────────────────────
-// Tüm araçların (Araç 1-5) sabit ev adresi, kuyruktan düşürülen adresler
-// gibi bilgilerini tutan TEK, PAYLAŞILAN bir kayıt. :user_id parametresi
-// (geriye dönük uyumluluk için URL'de duruyor ama) kullanılmıyor —
-// çünkü bu veri kullanıcıya değil, araç filosunun tamamına ait.
-app.post("/fleet/:user_id", async (req, res) => {
-  const { vehicles } = req.body;
-  try {
-    await pool.query(
-      `INSERT INTO fleet_workspace (singleton_id, vehicles, updated_at)
-       VALUES (1, $1, NOW())
-       ON CONFLICT (singleton_id)
-       DO UPDATE SET vehicles = $1, updated_at = NOW()`,
-      [vehicles]
-    );
-    res.json({ message: "Filo bilgisi kaydedildi" });
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: "Filo bilgisi kaydedilemedi" });
-  }
-});
-
-app.get("/fleet/:user_id", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT vehicles, updated_at FROM fleet_workspace WHERE singleton_id = 1"
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Filo bilgisi bulunamadı" });
-    }
-    res.json({
-      vehicles: result.rows[0].vehicles,
-      updatedAt: result.rows[0].updated_at,
-    });
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: "Filo bilgisi alınamadı" });
-  }
-});
-
 // ── Exact TSP (Held-Karp) — veri kaynağından bağımsız ─────────────────
-// cost: NxN süre matrisi (saniye), node 0 = sabit başlangıç/bitiş.
-// Masaüstündeki Dart _tsp.solveExact() ile birebir aynı algoritma.
 function solveExactTsp(cost) {
   const n = cost.length;
   const m = n - 1;
@@ -541,7 +563,6 @@ function solveExactTsp(cost) {
   return { order: order.map((i) => i + 1), totalCost: best };
 }
 
-// ── Google Distance Matrix (trafik dahil) ile NxN süre/mesafe matrisi ──
 async function fetchGoogleMatrix(nodes) {
   const coordStr = nodes.map((n) => `${n.latitude},${n.longitude}`).join("|");
   const url =
@@ -567,7 +588,6 @@ async function fetchGoogleMatrix(nodes) {
     for (let j = 0; j < n; j++) {
       const el = elements[j];
       if (el.status !== "OK") continue;
-      // Trafik verisi varsa onu kullan, yoksa normal süreye düş.
       durations[i][j] = el.duration_in_traffic
         ? el.duration_in_traffic.value
         : el.duration.value;
@@ -578,8 +598,7 @@ async function fetchGoogleMatrix(nodes) {
   return { durations, distances };
 }
 
-// ── Rota optimizasyonu: Google trafik verisi + exact TSP ──────────────
-app.post("/routes/optimize", async (req, res) => {
+app.post("/routes/optimize", authenticateToken, async (req, res) => {
   const { origin, stops } = req.body;
 
   if (!origin || !stops || stops.length === 0) {
