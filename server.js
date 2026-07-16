@@ -6,6 +6,14 @@ const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getMessaging } = require("firebase-admin/messaging");
+const Sentry = require("@sentry/node");
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    tracesSampleRate: 1.0,
+  });
+}
 
 const app = express();
 
@@ -574,6 +582,10 @@ app.post("/routes/optimize", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Rota optimizasyonu başarısız" });
   }
 });
+
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
