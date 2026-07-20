@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
 const { initializeApp, cert } = require("firebase-admin/app");
@@ -17,8 +18,28 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
-app.use(cors());
+const corsOrigin = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
+  : undefined;
+app.use(cors(corsOrigin ? { origin: corsOrigin } : undefined));
 app.use(express.json({ limit: "10mb" }));
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla istek gönderildi, lütfen daha sonra tekrar deneyin" },
+});
+app.use(apiLimiter);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla deneme yapıldı, lütfen daha sonra tekrar deneyin" },
+});
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -126,7 +147,7 @@ app.get("/", (req, res) => {
   res.json({ message: "Rota360 backend çalışıyor", version: "1.5.0" });
 });
 
-app.post("/register", async (req, res) => {
+app.post("/register", authLimiter, async (req, res) => {
   const { username, password, role, email } = req.body;
   try {
     await pool.query(
@@ -393,7 +414,7 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
   }
 });
 
-app.post("/login", async (req, res) => {
+app.post("/login", authLimiter, async (req, res) => {
   const { username, password } = req.body;
   try {
     const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
@@ -556,11 +577,19 @@ async function fetchGoogleMatrix(nodes) {
   return { durations, distances };
 }
 
+const MAX_OPTIMIZE_STOPS = Number(process.env.MAX_OPTIMIZE_STOPS) || 15;
+
 app.post("/routes/optimize", authenticateToken, async (req, res) => {
   const { origin, stops } = req.body;
 
   if (!origin || !stops || stops.length === 0) {
     return res.status(400).json({ error: "origin ve stops gerekli" });
+  }
+
+  if (stops.length > MAX_OPTIMIZE_STOPS) {
+    return res.status(400).json({
+      error: `Rota optimizasyonu en fazla ${MAX_OPTIMIZE_STOPS} durak destekler (gönderilen: ${stops.length})`,
+    });
   }
 
   try {
