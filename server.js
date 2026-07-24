@@ -18,10 +18,26 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
-const corsOrigin = process.env.CORS_ORIGIN
+// ── CORS: production domain'leri (CORS_ORIGIN env değişkeninden, virgülle ayrılmış)
+// + geliştirme sırasında HER localhost portuna otomatik izin verir ─────────
+const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
-  : undefined;
-app.use(cors(corsOrigin ? { origin: corsOrigin } : undefined));
+  : [];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // origin yoksa (mobil uygulama, Postman, curl gibi) izin ver
+    if (!origin) return callback(null, true);
+    // production listesinde varsa izin ver
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // herhangi bir localhost portu ise izin ver (flutter run -d chrome her seferinde port değiştiriyor)
+    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
+    if (/^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
+    return callback(new Error("CORS engellendi: " + origin));
+  },
+  credentials: true,
+}));
+
 app.use(express.json({ limit: "10mb" }));
 
 const apiLimiter = rateLimit({
