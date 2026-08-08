@@ -430,6 +430,33 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
   }
 });
 
+app.patch("/routes/:route_id/complete", authenticateToken, async (req, res) => {
+  const { route_id } = req.params;
+  try {
+    const result = await pool.query("SELECT * FROM routes WHERE id = $1", [route_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Rota bulunamadı" });
+    }
+    const route = result.rows[0];
+    const routeJson = parseRouteJson(route.route_json);
+    const updatedRouteJson = {
+      ...routeJson,
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const updateResult = await pool.query(
+      "UPDATE routes SET route_json = $1 WHERE id = $2 RETURNING *",
+      [updatedRouteJson, route_id]
+    );
+    res.json({ message: "Rota tamamlandı", route: normalizeRoute(updateResult.rows[0]) });
+  } catch (err) {
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 app.post("/login", authLimiter, async (req, res) => {
   const { username, password } = req.body;
   try {
