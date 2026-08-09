@@ -63,6 +63,17 @@ const authLimiter = rateLimit({
   message: { error: "Çok fazla deneme yapıldı, lütfen daha sonra tekrar deneyin" },
 });
 
+// /routes/optimize her çağrıda ücretli Google Distance Matrix isteği atıyor
+// (durak sayısının karesi kadar element) — genel apiLimiter'dan çok daha
+// sıkı bir limit koyup maliyet-DoS riskini azaltıyoruz.
+const optimizeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Rota optimizasyonu için çok fazla istek gönderildi, lütfen daha sonra tekrar deneyin" },
+});
+
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
@@ -94,6 +105,7 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
       CREATE TABLE IF NOT EXISTS routes (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id INTEGER REFERENCES users(id),
@@ -148,6 +160,11 @@ function normalizeRoute(row) {
 }
 
 // ── JWT Doğrulama Middleware ───────────────────────────────────────────
+// İmza + süre doğrulamasının ardından, token'daki token_version'ı DB'deki
+// güncel değerle karşılaştırır. Bu sayede admin bir kullanıcının şifresini
+// sıfırladığında (bkz. admin-reset-password) o kullanıcının önceden alınmış
+// tüm token'ları anında geçersiz olur — aksi halde JWT süresi (30 gün)
+// dolana kadar çalınmış/eski bir token geçerli kalırdı.
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -156,12 +173,25 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: "Giriş yapmanız gerekiyor" });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  jwt.verify(token, process.env.JWT_SECRET, async (err, decoded) => {
     if (err) {
       return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş" });
     }
-    req.user = user;
-    next();
+    try {
+      const result = await pool.query(
+        "SELECT token_version FROM users WHERE id = $1",
+        [decoded.user_id]
+      );
+      if (result.rows.length === 0 || result.rows[0].token_version !== decoded.token_version) {
+        return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş" });
+      }
+      req.user = decoded;
+      next();
+    } catch (dbErr) {
+      console.error("Token doğrulama hatası:", dbErr);
+      if (process.env.SENTRY_DSN) Sentry.captureException(dbErr);
+      res.status(500).json({ error: "Sunucu hatası" });
+    }
   });
 }
 
@@ -173,6 +203,30 @@ function requireRole(...allowedRoles) {
     }
     next();
   };
+}
+
+const STAFF_ROLES = ["admin", "dispatcher"];
+
+// Sahiplik kontrolü: admin/dispatcher her zaman erişebilir, driver sadece
+// kendi user_id'sine ait kaynağa. authenticateToken'dan sonra kullanılmalı.
+function canAccessUser(req, targetUserId) {
+  if (!req.user) return false;
+  if (STAFF_ROLES.includes(req.user.role)) return true;
+  return String(req.user.user_id) === String(targetUserId);
+}
+
+// vehicle_id üzerinden erişim: admin/dispatcher her zaman, driver ise sadece
+// kendisine atanmış aracın verisine erişebilir (DB'den güncel atamayı okur).
+async function canAccessVehicle(req, vehicleId) {
+  if (!req.user) return false;
+  if (STAFF_ROLES.includes(req.user.role)) return true;
+  const result = await pool.query("SELECT vehicle_id FROM users WHERE id = $1", [req.user.user_id]);
+  if (result.rows.length === 0) return false;
+  return String(result.rows[0].vehicle_id) === String(vehicleId);
+}
+
+function forbidden(res) {
+  return res.status(403).json({ error: "Bu veriye erişim yetkiniz yok" });
 }
 
 app.get("/", (req, res) => {
@@ -238,7 +292,9 @@ app.post("/users/:user_id/admin-reset-password", authenticateToken, requireRole(
   }
   try {
     const result = await pool.query(
-      "UPDATE users SET password_hash = crypt($1, gen_salt('bf')) WHERE id = $2 RETURNING username",
+      // token_version'ı da artırıyoruz ki şifre sıfırlandığında bu
+      // kullanıcının önceden alınmış tüm oturumları anında düşsün.
+      "UPDATE users SET password_hash = crypt($1, gen_salt('bf')), token_version = token_version + 1 WHERE id = $2 RETURNING username",
       [newPassword, user_id]
     );
     if (result.rows.length === 0) {
@@ -254,6 +310,7 @@ app.post("/users/:user_id/admin-reset-password", authenticateToken, requireRole(
 
 app.post("/users/:user_id/fcm-token", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   const { fcm_token } = req.body;
   try {
     await pool.query("UPDATE users SET fcm_token = $1 WHERE id = $2", [
@@ -273,6 +330,9 @@ app.post("/routes", authenticateToken, async (req, res) => {
   if (!user_id || !route_json) {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
   }
+  // Bir sürücü sadece kendi adına rota oluşturabilir; başkası adına rota
+  // (ve o kişiye giden push bildirimi) sadece admin/dispatcher atayabilir.
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   const now = new Date().toISOString();
   const parsedRouteJson = parseRouteJson(route_json);
   const resolvedVehicleId = vehicle_id ?? parsedRouteJson.vehicleId ?? null;
@@ -320,6 +380,7 @@ app.post("/routes", authenticateToken, async (req, res) => {
 
 app.get("/routes/:user_id", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   try {
     const result = await pool.query(
       "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC",
@@ -335,6 +396,7 @@ app.get("/routes/:user_id", authenticateToken, async (req, res) => {
 
 app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   try {
     const result = await pool.query(
       "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -353,6 +415,7 @@ app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
 
 app.get("/vehicles/:vehicle_id/active-route", authenticateToken, async (req, res) => {
   const { vehicle_id } = req.params;
+  if (!(await canAccessVehicle(req, vehicle_id))) return forbidden(res);
   try {
     const result = await pool.query(
       "SELECT * FROM routes WHERE vehicle_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -369,7 +432,7 @@ app.get("/vehicles/:vehicle_id/active-route", authenticateToken, async (req, res
   }
 });
 
-app.post("/fleet/:user_id", authenticateToken, async (req, res) => {
+app.post("/fleet/:user_id", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
   const { vehicles } = req.body;
   try {
     await pool.query(
@@ -415,6 +478,7 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
       return res.status(404).json({ error: "Rota bulunamadı" });
     }
     const route = result.rows[0];
+    if (!canAccessUser(req, route.user_id)) return forbidden(res);
     const routeJson = parseRouteJson(route.route_json);
     const stops = Array.isArray(routeJson.stops)
       ? routeJson.stops
@@ -448,6 +512,52 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
   }
 });
 
+app.patch("/routes/:route_id/stops/:stop_id/note", authenticateToken, async (req, res) => {
+  const { route_id, stop_id } = req.params;
+  const { note } = req.body;
+  if (typeof note !== "string") {
+    return res.status(400).json({ error: "note (string) zorunlu" });
+  }
+  try {
+    const result = await pool.query("SELECT * FROM routes WHERE id = $1", [route_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Rota bulunamadı" });
+    }
+    const route = result.rows[0];
+    if (!canAccessUser(req, route.user_id)) return forbidden(res);
+    const routeJson = parseRouteJson(route.route_json);
+    const stops = Array.isArray(routeJson.stops)
+      ? routeJson.stops
+      : Array.isArray(routeJson.addresses)
+        ? routeJson.addresses
+        : [];
+    let found = false;
+    const updatedStops = stops.map((stop, index) => {
+      const stopMatches =
+        String(stop.id ?? "") === String(stop_id) ||
+        String(stop.code ?? "") === String(stop_id) ||
+        String(stop.order ?? "") === String(stop_id) ||
+        String(index + 1) === String(stop_id);
+      if (!stopMatches) return stop;
+      found = true;
+      return { ...stop, notes: note };
+    });
+    if (!found) {
+      return res.status(404).json({ error: "Durak bulunamadı" });
+    }
+    const updatedRouteJson = { ...routeJson, stops: updatedStops, updatedAt: new Date().toISOString() };
+    const updateResult = await pool.query(
+      "UPDATE routes SET route_json = $1 WHERE id = $2 RETURNING *",
+      [updatedRouteJson, route_id]
+    );
+    res.json({ message: "Not güncellendi", route: normalizeRoute(updateResult.rows[0]) });
+  } catch (err) {
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 app.patch("/routes/:route_id/complete", authenticateToken, async (req, res) => {
   const { route_id } = req.params;
   try {
@@ -456,6 +566,7 @@ app.patch("/routes/:route_id/complete", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Rota bulunamadı" });
     }
     const route = result.rows[0];
+    if (!canAccessUser(req, route.user_id)) return forbidden(res);
     const routeJson = parseRouteJson(route.route_json);
     const updatedRouteJson = {
       ...routeJson,
@@ -479,8 +590,14 @@ app.post("/login", authLimiter, async (req, res) => {
   const { username, password } = req.body;
   try {
     const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+    // Kullanıcı adı ile şifre hatası aynı mesajı dönmeli — aksi halde
+    // saldırgan hangi kullanıcı adlarının var olduğunu (username
+    // enumeration) tespit edebilir.
+    const invalidCredentials = () =>
+      res.status(401).json({ error: "Kullanıcı adı veya şifre hatalı" });
+
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: "Kullanıcı bulunamadı" });
+      return invalidCredentials();
     }
     const user = result.rows[0];
     const passwordCheck = await pool.query(
@@ -488,11 +605,11 @@ app.post("/login", authLimiter, async (req, res) => {
       [password, user.password_hash]
     );
     if (!passwordCheck.rows[0].match) {
-      return res.status(401).json({ error: "Şifre hatalı" });
+      return invalidCredentials();
     }
 
     const token = jwt.sign(
-      { user_id: user.id, username: user.username, role: user.role },
+      { user_id: user.id, username: user.username, role: user.role, token_version: user.token_version },
       process.env.JWT_SECRET,
       { expiresIn: "30d" }
     );
@@ -514,6 +631,7 @@ app.post("/login", authLimiter, async (req, res) => {
 
 app.post("/drivers/:user_id/location", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   const { latitude, longitude } = req.body;
   try {
     await pool.query(
@@ -530,6 +648,7 @@ app.post("/drivers/:user_id/location", authenticateToken, async (req, res) => {
 
 app.get("/drivers/:user_id/location", authenticateToken, async (req, res) => {
   const { user_id } = req.params;
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   try {
     const result = await pool.query(
       "SELECT * FROM driver_locations WHERE user_id = $1 ORDER BY recorded_at DESC LIMIT 1",
@@ -640,7 +759,7 @@ async function fetchGoogleMatrix(nodes) {
 
 const MAX_OPTIMIZE_STOPS = Number(process.env.MAX_OPTIMIZE_STOPS) || 15;
 
-app.post("/routes/optimize", authenticateToken, async (req, res) => {
+app.post("/routes/optimize", optimizeLimiter, authenticateToken, async (req, res) => {
   const { origin, stops } = req.body;
 
   if (!origin || !stops || stops.length === 0) {
@@ -694,6 +813,21 @@ app.post("/routes/optimize", authenticateToken, async (req, res) => {
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
+
+// ── Genel hata yakalayıcı — mutlaka en sonda ────────────────────────────
+// CORS reddi (cors middleware'in callback(new Error(...)) çağırması) ve
+// beklenmeyen diğer tüm hatalar buraya düşer. NODE_ENV ne olursa olsun
+// istemciye stack trace / dosya yolu gibi iç detay asla dönülmez.
+app.use((err, req, res, _next) => {
+  if (err && typeof err.message === "string" && err.message.startsWith("CORS engellendi")) {
+    return res.status(403).json({ error: "Bu kaynağa erişim izni yok" });
+  }
+  console.error("Beklenmeyen hata:", err);
+  // SENTRY_DSN tanımlıysa Sentry.setupExpressErrorHandler (yukarıda) bu
+  // hatayı zaten yakalayıp raporladı — burada tekrar capture etmiyoruz.
+  if (res.headersSent) return;
+  res.status(err?.status || 500).json({ error: "Sunucu hatası" });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
