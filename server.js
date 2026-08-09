@@ -623,6 +623,72 @@ app.patch("/routes/:route_id/stops", authenticateToken, async (req, res) => {
   }
 });
 
+// Mobil sürücünün harita üzerinden eklediği yeni durağı rotaya ekler.
+// Body: { stop: { street, latitude, longitude, customerName?, customerType?, ... } }
+app.post("/routes/:route_id/stops", authenticateToken, async (req, res) => {
+  const { route_id } = req.params;
+  const { stop } = req.body;
+  if (!stop || typeof stop.latitude !== "number" || typeof stop.longitude !== "number") {
+    return res.status(400).json({ error: "stop.latitude ve stop.longitude (number) zorunlu" });
+  }
+  try {
+    const result = await pool.query("SELECT * FROM routes WHERE id = $1", [route_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Rota bulunamadı" });
+    }
+    const route = result.rows[0];
+    if (!(await canAccessRoute(req, route))) return forbidden(res);
+
+    const routeJson = parseRouteJson(route.route_json);
+    const currentStops = Array.isArray(routeJson.stops)
+      ? routeJson.stops
+      : Array.isArray(routeJson.addresses)
+        ? routeJson.addresses
+        : [];
+
+    // Mevcut en büyük sayısal ID'nin üzerine yeni ID üret
+    const maxId = currentStops.reduce((max, s) => {
+      const n = parseInt(String(s.id ?? s.code ?? "0"), 10);
+      return isNaN(n) ? max : Math.max(max, n);
+    }, 0);
+
+    const newStop = {
+      id: maxId + 1,
+      order: currentStops.length + 1,
+      street: stop.street ?? "",
+      district: stop.district ?? "",
+      city: stop.city ?? "",
+      postalCode: stop.postalCode ?? "",
+      latitude: stop.latitude,
+      longitude: stop.longitude,
+      customerName: stop.customerName ?? `Yeni Durak ${currentStops.length + 1}`,
+      customerType: stop.customerType ?? "Müşteri",
+      completed: false,
+      addedByDriver: true,
+      addedAt: new Date().toISOString(),
+    };
+
+    const updatedRouteJson = {
+      ...routeJson,
+      stops: [...currentStops, newStop],
+      updatedAt: new Date().toISOString(),
+    };
+    const updateResult = await pool.query(
+      "UPDATE routes SET route_json = $1 WHERE id = $2 RETURNING *",
+      [updatedRouteJson, route_id]
+    );
+    res.status(201).json({
+      message: "Durak eklendi",
+      stop: newStop,
+      route: normalizeRoute(updateResult.rows[0]),
+    });
+  } catch (err) {
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 app.patch("/routes/:route_id/complete", authenticateToken, async (req, res) => {
   const { route_id } = req.params;
   try {
