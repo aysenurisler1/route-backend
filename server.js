@@ -571,6 +571,58 @@ app.patch("/routes/:route_id/stops/:stop_id/note", authenticateToken, async (req
   }
 });
 
+// Mobil sürücünün sürükleme ile değiştirdiği stop sırasını kalıcı kaydeder.
+// Body: { stops: [ { id, order, ... } ] }  — sadece id ve order zorunlu,
+// geri kalan alanlar mevcut değerleri koruyor.
+app.patch("/routes/:route_id/stops", authenticateToken, async (req, res) => {
+  const { route_id } = req.params;
+  const { stops: newOrder } = req.body;
+  if (!Array.isArray(newOrder) || newOrder.length === 0) {
+    return res.status(400).json({ error: "stops dizisi gerekli" });
+  }
+  try {
+    const result = await pool.query("SELECT * FROM routes WHERE id = $1", [route_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Rota bulunamadı" });
+    }
+    const route = result.rows[0];
+    if (!(await canAccessRoute(req, route))) return forbidden(res);
+
+    const routeJson = parseRouteJson(route.route_json);
+    const currentStops = Array.isArray(routeJson.stops)
+      ? routeJson.stops
+      : Array.isArray(routeJson.addresses)
+        ? routeJson.addresses
+        : [];
+
+    // newOrder'daki id→order eşleşmesini uygula; bilinmeyen id'ler görmezden geliniyor.
+    const orderMap = {};
+    newOrder.forEach((s) => {
+      if (s.id != null) orderMap[String(s.id)] = s.order;
+    });
+
+    const updatedStops = currentStops
+      .map((stop) => {
+        const key = String(stop.id ?? stop.code ?? "");
+        return key && orderMap[key] != null
+          ? { ...stop, order: orderMap[key] }
+          : stop;
+      })
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+    const updatedRouteJson = { ...routeJson, stops: updatedStops, updatedAt: new Date().toISOString() };
+    const updateResult = await pool.query(
+      "UPDATE routes SET route_json = $1 WHERE id = $2 RETURNING *",
+      [updatedRouteJson, route_id]
+    );
+    res.json({ message: "Durak sırası güncellendi", route: normalizeRoute(updateResult.rows[0]) });
+  } catch (err) {
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 app.patch("/routes/:route_id/complete", authenticateToken, async (req, res) => {
   const { route_id } = req.params;
   try {
