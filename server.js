@@ -225,6 +225,17 @@ async function canAccessVehicle(req, vehicleId) {
   return String(result.rows[0].vehicle_id) === String(vehicleId);
 }
 
+// Bir rotaya erişim: rotanın sahibiyim (canAccessUser) YA DA rota bir araca
+// atanmışsa o araca ben atanmışım (canAccessVehicle). İkincisi olmadan,
+// GET /vehicles/:id/active-route ile (araca göre) görüntülenebilen bir rota,
+// başka bir kullanıcı adına oluşturulmuşsa PATCH ile tamamlanamıyordu —
+// sürücü rotayı görüp tamamlayamıyordu.
+async function canAccessRoute(req, route) {
+  if (canAccessUser(req, route.user_id)) return true;
+  if (route.vehicle_id === null || route.vehicle_id === undefined) return false;
+  return canAccessVehicle(req, route.vehicle_id);
+}
+
 function forbidden(res) {
   return res.status(403).json({ error: "Bu veriye erişim yetkiniz yok" });
 }
@@ -480,7 +491,7 @@ app.patch("/routes/:route_id/stops/:stop_id/complete", authenticateToken, async 
       return res.status(404).json({ error: "Rota bulunamadı" });
     }
     const route = result.rows[0];
-    if (!canAccessUser(req, route.user_id)) return forbidden(res);
+    if (!(await canAccessRoute(req, route))) return forbidden(res);
     const routeJson = parseRouteJson(route.route_json);
     const stops = Array.isArray(routeJson.stops)
       ? routeJson.stops
@@ -526,7 +537,7 @@ app.patch("/routes/:route_id/stops/:stop_id/note", authenticateToken, async (req
       return res.status(404).json({ error: "Rota bulunamadı" });
     }
     const route = result.rows[0];
-    if (!canAccessUser(req, route.user_id)) return forbidden(res);
+    if (!(await canAccessRoute(req, route))) return forbidden(res);
     const routeJson = parseRouteJson(route.route_json);
     const stops = Array.isArray(routeJson.stops)
       ? routeJson.stops
@@ -568,7 +579,7 @@ app.patch("/routes/:route_id/complete", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Rota bulunamadı" });
     }
     const route = result.rows[0];
-    if (!canAccessUser(req, route.user_id)) return forbidden(res);
+    if (!(await canAccessRoute(req, route))) return forbidden(res);
     const routeJson = parseRouteJson(route.route_json);
     const updatedRouteJson = {
       ...routeJson,
