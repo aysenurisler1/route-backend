@@ -170,12 +170,12 @@ function authenticateToken(req, res, next) {
   const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
-    return res.status(401).json({ error: "Giriş yapmanız gerekiyor" });
+    return res.status(401).json({ error: "Giriş yapmanız gerekiyor", code: "SESSION_EXPIRED" });
   }
 
   jwt.verify(token, process.env.JWT_SECRET, async (err, decoded) => {
     if (err) {
-      return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş" });
+      return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş", code: "SESSION_EXPIRED" });
     }
     try {
       const result = await pool.query(
@@ -183,7 +183,7 @@ function authenticateToken(req, res, next) {
         [decoded.user_id]
       );
       if (result.rows.length === 0 || result.rows[0].token_version !== decoded.token_version) {
-        return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş" });
+        return res.status(403).json({ error: "Oturum geçersiz veya süresi dolmuş", code: "SESSION_EXPIRED" });
       }
       req.user = decoded;
       next();
