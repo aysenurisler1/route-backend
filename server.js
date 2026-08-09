@@ -269,7 +269,9 @@ app.post("/users/:user_id/assign-vehicle", authenticateToken, requireRole("admin
   }
 });
 
-app.get("/users/drivers", authenticateToken, async (req, res) => {
+// Sürücü listesi kurum personeline (web panelindeki araç/sürücü atama
+// ekranı) ait — sürücülerin birbirini görebilmesine gerek yok.
+app.get("/users/drivers", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT id, username, vehicle_id FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
