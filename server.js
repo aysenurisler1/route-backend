@@ -18,6 +18,12 @@ if (process.env.SENTRY_DSN) {
 
 const app = express();
 
+// Render (ve benzeri) tek katmanli reverse proxy arkasinda calisirken,
+// express-rate-limit'in gercek istemci IP'sini (X-Forwarded-For) dogru
+// okuyabilmesi icin gerekli. Olmadan herkes ayni IP'den geliyormus gibi
+// davranilir / rate-limit hata verebilir.
+app.set("trust proxy", 1);
+
 // ── CORS: production domain'leri (CORS_ORIGIN env değişkeninden, virgülle ayrılmış)
 // + geliştirme sırasında HER localhost portuna otomatik izin verir ─────────
 const allowedOrigins = process.env.CORS_ORIGIN
@@ -159,11 +165,23 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// ── Rol Kontrolü Middleware — authenticateToken'dan SONRA kullanılmalı ──
+function requireRole(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Bu işlem için yetkiniz yok" });
+    }
+    next();
+  };
+}
+
 app.get("/", (req, res) => {
   res.json({ message: "Rota360 backend çalışıyor", version: "1.5.0" });
 });
 
-app.post("/register", authLimiter, async (req, res) => {
+// Yalnizca giris yapmis admin/dispatcher yeni kullanici olusturabilir —
+// role bilgisi disaridan serbestce belirlenemesin diye.
+app.post("/register", authLimiter, authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
   const { username, password, role, email } = req.body;
   try {
     await pool.query(
@@ -178,7 +196,7 @@ app.post("/register", authLimiter, async (req, res) => {
   }
 });
 
-app.post("/users/:user_id/assign-vehicle", authenticateToken, async (req, res) => {
+app.post("/users/:user_id/assign-vehicle", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
   const { user_id } = req.params;
   const { vehicle_id } = req.body;
   try {
@@ -212,7 +230,7 @@ app.get("/users/drivers", authenticateToken, async (req, res) => {
 
 // Yönetici (dispatcher), giriş yapmış personelin şifresini sıfırlar.
 // E-posta gerektirmez — sadece giriş yapmış (token'lı) biri çağırabilir.
-app.post("/users/:user_id/admin-reset-password", authenticateToken, async (req, res) => {
+app.post("/users/:user_id/admin-reset-password", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
   const { user_id } = req.params;
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) {
