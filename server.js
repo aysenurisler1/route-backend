@@ -135,7 +135,46 @@ async function initDB() {
   }
 }
 
-initDB();
+// ── Sürücü hesaplarını hazırla ──────────────────────────────────────────
+// testdriver hesabını kaldırır, yerine sürücü1..sürücü10 (şifreler
+// palyatif1..palyatif10) hesaplarını oluşturur/günceller. Sunucu her
+// başladığında (ör. Render'a her deploy'da) çalışır; ON CONFLICT sayesinde
+// tekrar tekrar çalışması sorun yaratmaz (idempotent).
+const DRIVER_COUNT = 10;
+
+async function setupDrivers() {
+  try {
+    const deleted = await pool.query(
+      "DELETE FROM users WHERE username = $1 RETURNING id, username",
+      ["testdriver"]
+    );
+    if (deleted.rows.length > 0) {
+      console.log(`Silindi: ${deleted.rows[0].username} (id ${deleted.rows[0].id})`);
+    }
+
+    for (let i = 1; i <= DRIVER_COUNT; i++) {
+      const username = `sürücü${i}`;
+      const password = `palyatif${i}`;
+      const result = await pool.query(
+        `INSERT INTO users (username, password_hash, role)
+         VALUES ($1, crypt($2, gen_salt('bf')), 'driver')
+         ON CONFLICT (username)
+         DO UPDATE SET password_hash = crypt($2, gen_salt('bf')), role = 'driver'
+         RETURNING id, username`,
+        [username, password]
+      );
+      console.log(`Hazır: ${result.rows[0].username} (id ${result.rows[0].id})`);
+    }
+    console.log("Sürücü hesapları hazır");
+  } catch (err) {
+    console.error("Sürücü hesapları oluşturma hatası:", err.message);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+  }
+}
+
+// Tablolar hazır olmadan sürücü hesabı eklenmeye çalışılmasın diye
+// setupDrivers, initDB bittikten sonra (ardışık) çalıştırılır.
+initDB().then(setupDrivers);
 
 function parseRouteJson(value) {
   if (!value) return {};
@@ -205,9 +244,9 @@ function requireRole(...allowedRoles) {
   };
 }
 
-const STAFF_ROLES = ["admin", "dispatcher"];
+const STAFF_ROLES = ["admin"];
 
-// Sahiplik kontrolü: admin/dispatcher her zaman erişebilir, driver sadece
+// Sahiplik kontrolü: admin her zaman erişebilir, driver sadece
 // kendi user_id'sine ait kaynağa. authenticateToken'dan sonra kullanılmalı.
 function canAccessUser(req, targetUserId) {
   if (!req.user) return false;
@@ -215,7 +254,7 @@ function canAccessUser(req, targetUserId) {
   return String(req.user.user_id) === String(targetUserId);
 }
 
-// vehicle_id üzerinden erişim: admin/dispatcher her zaman, driver ise sadece
+// vehicle_id üzerinden erişim: admin her zaman, driver ise sadece
 // kendisine atanmış aracın verisine erişebilir (DB'den güncel atamayı okur).
 async function canAccessVehicle(req, vehicleId) {
   if (!req.user) return false;
@@ -244,9 +283,9 @@ app.get("/", (req, res) => {
   res.json({ message: "Rota360 backend çalışıyor", version: "1.5.0" });
 });
 
-// Yalnizca giris yapmis admin/dispatcher yeni kullanici olusturabilir —
+// Yalnizca giris yapmis admin yeni kullanici olusturabilir —
 // role bilgisi disaridan serbestce belirlenemesin diye.
-app.post("/register", authLimiter, authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
+app.post("/register", authLimiter, authenticateToken, requireRole("admin"), async (req, res) => {
   const { username, password, role, email } = req.body;
   try {
     await pool.query(
@@ -261,7 +300,7 @@ app.post("/register", authLimiter, authenticateToken, requireRole("admin", "disp
   }
 });
 
-app.post("/users/:user_id/assign-vehicle", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
+app.post("/users/:user_id/assign-vehicle", authenticateToken, requireRole("admin"), async (req, res) => {
   const { user_id } = req.params;
   const { vehicle_id } = req.body;
   try {
@@ -282,7 +321,7 @@ app.post("/users/:user_id/assign-vehicle", authenticateToken, requireRole("admin
 
 // Sürücü listesi kurum personeline (web panelindeki araç/sürücü atama
 // ekranı) ait — sürücülerin birbirini görebilmesine gerek yok.
-app.get("/users/drivers", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
+app.get("/users/drivers", authenticateToken, requireRole("admin"), async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT id, username, vehicle_id FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
@@ -295,9 +334,9 @@ app.get("/users/drivers", authenticateToken, requireRole("admin", "dispatcher"),
   }
 });
 
-// Yönetici (dispatcher), giriş yapmış personelin şifresini sıfırlar.
+// Yönetici (admin), giriş yapmış personelin şifresini sıfırlar.
 // E-posta gerektirmez — sadece giriş yapmış (token'lı) biri çağırabilir.
-app.post("/users/:user_id/admin-reset-password", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
+app.post("/users/:user_id/admin-reset-password", authenticateToken, requireRole("admin"), async (req, res) => {
   const { user_id } = req.params;
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) {
@@ -344,7 +383,7 @@ app.post("/routes", authenticateToken, async (req, res) => {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
   }
   // Bir sürücü sadece kendi adına rota oluşturabilir; başkası adına rota
-  // (ve o kişiye giden push bildirimi) sadece admin/dispatcher atayabilir.
+  // (ve o kişiye giden push bildirimi) sadece admin atayabilir.
   if (!canAccessUser(req, user_id)) return forbidden(res);
   const now = new Date().toISOString();
   const parsedRouteJson = parseRouteJson(route_json);
@@ -445,7 +484,7 @@ app.get("/vehicles/:vehicle_id/active-route", authenticateToken, async (req, res
   }
 });
 
-app.post("/fleet/:user_id", authenticateToken, requireRole("admin", "dispatcher"), async (req, res) => {
+app.post("/fleet/:user_id", authenticateToken, requireRole("admin"), async (req, res) => {
   const { vehicles } = req.body;
   try {
     await pool.query(
