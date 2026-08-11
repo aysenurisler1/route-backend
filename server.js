@@ -311,8 +311,12 @@ app.post("/register", authLimiter, authenticateToken, requireRole("admin"), asyn
 // için artık sadece kimlik bilgisi dönüyor.
 app.get("/users/drivers", authenticateToken, requireRole("admin"), async (req, res) => {
   try {
+    // Düz "ORDER BY username" sözlüksel sıralar: sürücü10, sürücü2'den önce
+    // gelirdi ("1" < "2"). Önce uzunluğa göre sıralamak sürücü1..sürücü9'u
+    // (8 karakter) sürücü10'dan (9 karakter) önce getiriyor — bu isimlendirme
+    // düzeninde doğal sayısal sırayla aynı sonucu veriyor.
     const result = await pool.query(
-      "SELECT id, username FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
+      "SELECT id, username FROM users WHERE role = 'driver' OR role IS NULL ORDER BY length(username), username"
     );
     res.json(result.rows);
   } catch (err) {
