@@ -127,6 +127,17 @@ async function initDB() {
         vehicles JSONB,
         updated_at TIMESTAMP DEFAULT NOW()
       );
+      -- "Araç" soyutlaması kaldırıldı (mobil zaten her zaman sürücünün
+      -- kendi hesabı üzerinden çalışıyordu, ayrı bir slot/atama katmanı
+      -- gereksizdi) — web panelindeki her sürücünün çalışma alanı artık
+      -- doğrudan kendi user_id'siyle burada tutulur. Eski fleet_workspace
+      -- tablosu geriye dönük uyumluluk için siliniyor değil, sadece
+      -- kullanılmıyor.
+      CREATE TABLE IF NOT EXISTS driver_workspace (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id),
+        workspace JSONB,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
     `);
     console.log("Veritabanı tabloları hazır");
   } catch (err) {
@@ -198,7 +209,6 @@ function normalizeRoute(row) {
   return {
     id: row.id,
     user_id: row.user_id,
-    vehicle_id: row.vehicle_id,
     name: row.name,
     created_at: row.created_at,
     updated_at: routeJson.updatedAt || routeJson.updated_at || row.created_at,
@@ -263,25 +273,11 @@ function canAccessUser(req, targetUserId) {
   return String(req.user.user_id) === String(targetUserId);
 }
 
-// vehicle_id üzerinden erişim: admin her zaman, driver ise sadece
-// kendisine atanmış aracın verisine erişebilir (DB'den güncel atamayı okur).
-async function canAccessVehicle(req, vehicleId) {
-  if (!req.user) return false;
-  if (STAFF_ROLES.includes(req.user.role)) return true;
-  const result = await pool.query("SELECT vehicle_id FROM users WHERE id = $1", [req.user.user_id]);
-  if (result.rows.length === 0) return false;
-  return String(result.rows[0].vehicle_id) === String(vehicleId);
-}
-
-// Bir rotaya erişim: rotanın sahibiyim (canAccessUser) YA DA rota bir araca
-// atanmışsa o araca ben atanmışım (canAccessVehicle). İkincisi olmadan,
-// GET /vehicles/:id/active-route ile (araca göre) görüntülenebilen bir rota,
-// başka bir kullanıcı adına oluşturulmuşsa PATCH ile tamamlanamıyordu —
-// sürücü rotayı görüp tamamlayamıyordu.
+// Bir rotaya erişim: rotanın sahibiyim (canAccessUser). Eskiden ayrıca
+// "araç" üzerinden dolaylı bir erişim yolu da vardı (canAccessVehicle) —
+// araç soyutlaması kaldırıldığı için artık tek kaynak user_id.
 async function canAccessRoute(req, route) {
-  if (canAccessUser(req, route.user_id)) return true;
-  if (route.vehicle_id === null || route.vehicle_id === undefined) return false;
-  return canAccessVehicle(req, route.vehicle_id);
+  return canAccessUser(req, route.user_id);
 }
 
 function forbidden(res) {
@@ -309,31 +305,14 @@ app.post("/register", authLimiter, authenticateToken, requireRole("admin"), asyn
   }
 });
 
-app.post("/users/:user_id/assign-vehicle", authenticateToken, requireRole("admin"), async (req, res) => {
-  const { user_id } = req.params;
-  const { vehicle_id } = req.body;
-  try {
-    const result = await pool.query(
-      "UPDATE users SET vehicle_id = $1 WHERE id = $2 RETURNING id, username, vehicle_id",
-      [vehicle_id ?? null, user_id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Kullanıcı bulunamadı" });
-    }
-    res.json({ message: "Araç ataması güncellendi", user: result.rows[0] });
-  } catch (err) {
-    console.log(err);
-    if (process.env.SENTRY_DSN) Sentry.captureException(err);
-    res.status(500).json({ error: "Hata oluştu" });
-  }
-});
-
-// Sürücü listesi kurum personeline (web panelindeki araç/sürücü atama
-// ekranı) ait — sürücülerin birbirini görebilmesine gerek yok.
+// Sürücü listesi kurum personeline (web panelindeki sürücü sekmeleri) ait
+// — sürücülerin birbirini görebilmesine gerek yok. Eskiden burada ayrıca
+// vehicle_id (araç ataması) de dönüyordu; araç soyutlaması kaldırıldığı
+// için artık sadece kimlik bilgisi dönüyor.
 app.get("/users/drivers", authenticateToken, requireRole("admin"), async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, username, vehicle_id FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
+      "SELECT id, username FROM users WHERE role = 'driver' OR role IS NULL ORDER BY username"
     );
     res.json(result.rows);
   } catch (err) {
@@ -387,7 +366,7 @@ app.post("/users/:user_id/fcm-token", authenticateToken, async (req, res) => {
 });
 
 app.post("/routes", authenticateToken, async (req, res) => {
-  const { user_id, name, route_json, vehicle_id } = req.body;
+  const { user_id, name, route_json } = req.body;
   if (!user_id || !route_json) {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
   }
@@ -396,32 +375,30 @@ app.post("/routes", authenticateToken, async (req, res) => {
   if (!canAccessUser(req, user_id)) return forbidden(res);
   const now = new Date().toISOString();
   const parsedRouteJson = parseRouteJson(route_json);
-  const resolvedVehicleId = vehicle_id ?? parsedRouteJson.vehicleId ?? null;
   const normalizedRouteJson = {
     ...parsedRouteJson,
-    vehicleId: resolvedVehicleId,
     status: parsedRouteJson.status || "active",
     createdAt: parsedRouteJson.createdAt || now,
     updatedAt: now,
   };
   try {
     const result = await pool.query(
-      "INSERT INTO routes (id, user_id, vehicle_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING *",
-      [user_id, resolvedVehicleId, name || "Rota360 Rota", normalizedRouteJson]
+      "INSERT INTO routes (id, user_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
+      [user_id, name || "Rota360 Rota", normalizedRouteJson]
     );
 
-    if (resolvedVehicleId !== null && messaging) {
+    if (messaging) {
       try {
         const driverResult = await pool.query(
-          "SELECT fcm_token FROM users WHERE vehicle_id = $1 AND fcm_token IS NOT NULL",
-          [resolvedVehicleId]
+          "SELECT fcm_token FROM users WHERE id = $1 AND fcm_token IS NOT NULL",
+          [user_id]
         );
         for (const row of driverResult.rows) {
           await messaging.send({
             token: row.fcm_token,
             notification: {
               title: "Yeni Rota Atandı",
-              body: `Araç ${resolvedVehicleId + 1} için yeni bir rota oluşturuldu.`,
+              body: "Sizin için yeni bir rota oluşturuldu.",
             },
           });
         }
@@ -474,59 +451,52 @@ app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/vehicles/:vehicle_id/active-route", authenticateToken, async (req, res) => {
-  const { vehicle_id } = req.params;
-  if (!(await canAccessVehicle(req, vehicle_id))) return forbidden(res);
-  try {
-    const result = await pool.query(
-      "SELECT * FROM routes WHERE vehicle_id = $1 ORDER BY created_at DESC LIMIT 1",
-      [vehicle_id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Bu araca atanmış aktif rota bulunamadı" });
-    }
-    res.json(normalizeRoute(result.rows[0]));
-  } catch (err) {
-    console.log(err);
-    if (process.env.SENTRY_DSN) Sentry.captureException(err);
-    res.status(500).json({ error: "Hata oluştu" });
-  }
-});
-
+// Web panelinin bir sürücü için hazırladığı çalışma alanını (adres
+// kuyruğu, sabit ev adresi, takvim planı) kaydeder/getirir. Eskiden bu
+// "araç" bazlı tek bir singleton satırdaydı (fleet_workspace); artık her
+// sürücünün kendi user_id'siyle ayrı bir satırı var (driver_workspace).
 app.post("/fleet/:user_id", authenticateToken, requireRole("admin"), async (req, res) => {
-  const { vehicles } = req.body;
+  const { user_id } = req.params;
+  const { workspace } = req.body;
   try {
     await pool.query(
-      `INSERT INTO fleet_workspace (singleton_id, vehicles, updated_at)
-       VALUES (1, $1, NOW())
-       ON CONFLICT (singleton_id)
-       DO UPDATE SET vehicles = $1, updated_at = NOW()`,
-      [vehicles]
+      `INSERT INTO driver_workspace (user_id, workspace, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id)
+       DO UPDATE SET workspace = $2, updated_at = NOW()`,
+      [user_id, workspace]
     );
-    res.json({ message: "Filo bilgisi kaydedildi" });
+    res.json({ message: "Çalışma alanı kaydedildi" });
   } catch (err) {
     console.log(err);
     if (process.env.SENTRY_DSN) Sentry.captureException(err);
-    res.status(500).json({ error: "Filo bilgisi kaydedilemedi" });
+    res.status(500).json({ error: "Çalışma alanı kaydedilemedi" });
   }
 });
 
 app.get("/fleet/:user_id", authenticateToken, async (req, res) => {
+  const { user_id } = req.params;
+  // Artık her sürücünün kendi gerçek çalışma verisi (adres/plan) burada
+  // tutulduğu için (eskiki paylaşımlı "filo" bloğunun aksine) sahiplik
+  // kontrolü şart — aksi halde bir sürücü başka bir sürücünün verisini
+  // okuyabilirdi.
+  if (!canAccessUser(req, user_id)) return forbidden(res);
   try {
     const result = await pool.query(
-      "SELECT vehicles, updated_at FROM fleet_workspace WHERE singleton_id = 1"
+      "SELECT workspace, updated_at FROM driver_workspace WHERE user_id = $1",
+      [user_id]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Filo bilgisi bulunamadı" });
+      return res.status(404).json({ error: "Çalışma alanı bulunamadı" });
     }
     res.json({
-      vehicles: result.rows[0].vehicles,
+      workspace: result.rows[0].workspace,
       updatedAt: result.rows[0].updated_at,
     });
   } catch (err) {
     console.log(err);
     if (process.env.SENTRY_DSN) Sentry.captureException(err);
-    res.status(500).json({ error: "Filo bilgisi alınamadı" });
+    res.status(500).json({ error: "Çalışma alanı alınamadı" });
   }
 });
 
@@ -797,7 +767,6 @@ app.post("/login", authLimiter, async (req, res) => {
       message: "Giriş başarılı",
       user_id: user.id,
       username: user.username,
-      vehicle_id: user.vehicle_id,
       role: user.role,
       token: token,
     });
