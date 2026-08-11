@@ -143,6 +143,11 @@ async function initDB() {
 const DRIVER_COUNT = 10;
 
 async function setupDrivers() {
+  // testdriver silme ve sürücü1..10 oluşturma ayrı try/catch'lerde:
+  // testdriver'a ait eski rota kayıtları varsa (routes.user_id FK'si,
+  // CASCADE yok) silme foreign-key hatasıyla başarısız olur — tek bir
+  // try/catch'te olsaydı bu hata döngüyü hiç çalıştırmadan fonksiyonu
+  // durdururdu ve sürücü1..10 asla oluşmazdı.
   try {
     const deleted = await pool.query(
       "DELETE FROM users WHERE username = $1 RETURNING id, username",
@@ -151,7 +156,11 @@ async function setupDrivers() {
     if (deleted.rows.length > 0) {
       console.log(`Silindi: ${deleted.rows[0].username} (id ${deleted.rows[0].id})`);
     }
+  } catch (err) {
+    console.error("testdriver silinemedi (muhtemelen ilişkili rota kaydı var), atlanıyor:", err.message);
+  }
 
+  try {
     for (let i = 1; i <= DRIVER_COUNT; i++) {
       const username = `sürücü${i}`;
       const password = `palyatif${i}`;
