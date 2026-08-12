@@ -194,7 +194,7 @@ async function setupDrivers() {
 
 // Tablolar hazır olmadan sürücü hesabı eklenmeye çalışılmasın diye
 // setupDrivers, initDB bittikten sonra (ardışık) çalıştırılır.
-initDB().then(setupDrivers);
+initDB();
 
 function parseRouteJson(value) {
   if (!value) return {};
