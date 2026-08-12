@@ -455,6 +455,20 @@ app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
   }
 });
 
+// Bir sürücüye atanmış TÜM rotaları siler — sürücü hesabına (users tablosu)
+// dokunmaz. Sadece admin çağırabilir; onay adımı web panelinde alınır.
+app.delete("/routes/:user_id", authenticateToken, requireRole("admin"), async (req, res) => {
+  const { user_id } = req.params;
+  try {
+    const result = await pool.query("DELETE FROM routes WHERE user_id = $1", [user_id]);
+    res.json({ message: "Rotalar silindi", count: result.rowCount });
+  } catch (err) {
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 // Web panelinin bir sürücü için hazırladığı çalışma alanını (adres
 // kuyruğu, sabit ev adresi, takvim planı) kaydeder/getirir. Eskiden bu
 // "araç" bazlı tek bir singleton satırdaydı (fleet_workspace); artık her
