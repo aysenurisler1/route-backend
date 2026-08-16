@@ -146,54 +146,6 @@ async function initDB() {
   }
 }
 
-// ── Sürücü hesaplarını hazırla ──────────────────────────────────────────
-// testdriver hesabını kaldırır, yerine sürücü1..sürücü10 (şifreler
-// palyatif1..palyatif10) hesaplarını oluşturur/günceller. Sunucu her
-// başladığında (ör. Render'a her deploy'da) çalışır; ON CONFLICT sayesinde
-// tekrar tekrar çalışması sorun yaratmaz (idempotent).
-const DRIVER_COUNT = 10;
-
-async function setupDrivers() {
-  // testdriver silme ve sürücü1..10 oluşturma ayrı try/catch'lerde:
-  // testdriver'a ait eski rota kayıtları varsa (routes.user_id FK'si,
-  // CASCADE yok) silme foreign-key hatasıyla başarısız olur — tek bir
-  // try/catch'te olsaydı bu hata döngüyü hiç çalıştırmadan fonksiyonu
-  // durdururdu ve sürücü1..10 asla oluşmazdı.
-  try {
-    const deleted = await pool.query(
-      "DELETE FROM users WHERE username = $1 RETURNING id, username",
-      ["testdriver"]
-    );
-    if (deleted.rows.length > 0) {
-      console.log(`Silindi: ${deleted.rows[0].username} (id ${deleted.rows[0].id})`);
-    }
-  } catch (err) {
-    console.error("testdriver silinemedi (muhtemelen ilişkili rota kaydı var), atlanıyor:", err.message);
-  }
-
-  try {
-    for (let i = 1; i <= DRIVER_COUNT; i++) {
-      const username = `sürücü${i}`;
-      const password = `palyatif${i}`;
-      const result = await pool.query(
-        `INSERT INTO users (username, password_hash, role)
-         VALUES ($1, crypt($2, gen_salt('bf')), 'driver')
-         ON CONFLICT (username)
-         DO UPDATE SET password_hash = crypt($2, gen_salt('bf')), role = 'driver'
-         RETURNING id, username`,
-        [username, password]
-      );
-      console.log(`Hazır: ${result.rows[0].username} (id ${result.rows[0].id})`);
-    }
-    console.log("Sürücü hesapları hazır");
-  } catch (err) {
-    console.error("Sürücü hesapları oluşturma hatası:", err.message);
-    if (process.env.SENTRY_DSN) Sentry.captureException(err);
-  }
-}
-
-// Tablolar hazır olmadan sürücü hesabı eklenmeye çalışılmasın diye
-// setupDrivers, initDB bittikten sonra (ardışık) çalıştırılır.
 initDB();
 
 function parseRouteJson(value) {
@@ -519,6 +471,45 @@ app.delete("/routes/:user_id", authenticateToken, requireRole("admin"), async (r
     console.log(err);
     if (process.env.SENTRY_DSN) Sentry.captureException(err);
     res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
+// Bir sürücü hesabını tamamen siler (users satırı + ona ait rotalar,
+// konum geçmişi ve çalışma alanı). Admin hesabı bu uçtan silinemez.
+// Not: hedef "sürücü1".."sürücü10" ise, backend bir sonraki başlangıçta
+// (Render deploy/restart) setupDrivers() sabit 10 hesabı yeniden
+// oluşturur — bu isimlerden biri silinirse restart sonrası geri gelir.
+app.delete("/users/:user_id", authenticateToken, requireRole("admin"), async (req, res) => {
+  const { user_id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const userResult = await client.query(
+      "SELECT id, username, role FROM users WHERE id = $1",
+      [user_id]
+    );
+    if (userResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Sürücü bulunamadı" });
+    }
+    const target = userResult.rows[0];
+    if (target.role === "admin") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Admin hesabı silinemez" });
+    }
+    await client.query("DELETE FROM routes WHERE user_id = $1", [user_id]);
+    await client.query("DELETE FROM driver_workspace WHERE user_id = $1", [user_id]);
+    await client.query("DELETE FROM driver_locations WHERE user_id = $1", [user_id]);
+    await client.query("DELETE FROM users WHERE id = $1", [user_id]);
+    await client.query("COMMIT");
+    res.json({ message: "Sürücü silindi", username: target.username });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  } finally {
+    client.release();
   }
 });
 
