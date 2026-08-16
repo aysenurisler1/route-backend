@@ -326,6 +326,59 @@ app.get("/users/drivers", authenticateToken, requireRole("admin"), async (req, r
   }
 });
 
+// Mobil admin ekranı için: her sürücünün bugünkü en son rotasının özeti
+// (toplam/tamamlanan durak, mesafe, süre). Tek seferde tüm filoyu göstermek
+// için — sürücü sayısı kadar ayrı /routes/:id/active çağrısı yapmak yerine.
+app.get("/routes/today/summary", authenticateToken, requireRole("admin"), async (req, res) => {
+  try {
+    const driversResult = await pool.query(
+      "SELECT id, username FROM users WHERE role = 'driver' OR role IS NULL ORDER BY length(username), username"
+    );
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const summaries = [];
+    for (const driver of driversResult.rows) {
+      const routeResult = await pool.query(
+        "SELECT route_json, created_at FROM routes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [driver.id]
+      );
+      if (routeResult.rows.length === 0) {
+        summaries.push({
+          userId: driver.id,
+          username: driver.username,
+          hasRouteToday: false,
+          totalStops: 0,
+          completedStops: 0,
+          totalKm: 0,
+          totalMin: 0,
+        });
+        continue;
+      }
+      const row = routeResult.rows[0];
+      const routeJson = parseRouteJson(row.route_json);
+      const isToday = new Date(row.created_at).toISOString().slice(0, 10) === todayStr;
+      const stops = Array.isArray(routeJson.stops)
+        ? routeJson.stops
+        : Array.isArray(routeJson.addresses)
+          ? routeJson.addresses
+          : [];
+      summaries.push({
+        userId: driver.id,
+        username: driver.username,
+        hasRouteToday: isToday && stops.length > 0,
+        totalStops: stops.length,
+        completedStops: stops.filter((s) => s.completed).length,
+        totalKm: routeJson.totalKm ?? 0,
+        totalMin: routeJson.totalMin ?? 0,
+      });
+    }
+    res.json(summaries);
+  } catch (err) {
+    console.log(err);
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
+    res.status(500).json({ error: "Hata oluştu" });
+  }
+});
+
 // Yönetici (admin), giriş yapmış personelin şifresini sıfırlar.
 // E-posta gerektirmez — sadece giriş yapmış (token'lı) biri çağırabilir.
 app.post("/users/:user_id/admin-reset-password", authenticateToken, requireRole("admin"), async (req, res) => {
