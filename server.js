@@ -967,7 +967,7 @@ async function fetchGoogleMatrix(nodes) {
   return { durations, distances };
 }
 
-const MAX_OPTIMIZE_STOPS = 18;
+const MAX_OPTIMIZE_STOPS = Number(process.env.MAX_OPTIMIZE_STOPS) || 15;
 
 app.post("/routes/optimize", optimizeLimiter, authenticateToken, async (req, res) => {
   const { origin, stops } = req.body;
