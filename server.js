@@ -115,6 +115,12 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       ALTER TABLE routes ADD COLUMN IF NOT EXISTS vehicle_id INTEGER;
+      -- Takvimden ileri tarihli plan girildiğinde her gün ayrı bir rota
+      -- satırı olarak saklanır. route_date NULL = eski (tarihsiz) kayıtlar;
+      -- geriye dönük uyumluluk için /active sorgusunda hâlâ fallback.
+      ALTER TABLE routes ADD COLUMN IF NOT EXISTS route_date DATE;
+      CREATE UNIQUE INDEX IF NOT EXISTS routes_user_date_uniq
+        ON routes(user_id, route_date) WHERE route_date IS NOT NULL;
       CREATE TABLE IF NOT EXISTS driver_locations (
         id SERIAL PRIMARY KEY,
         user_id INTEGER,
@@ -156,12 +162,30 @@ function parseRouteJson(value) {
   return value;
 }
 
+// Ekip Türkiye'de; "bugün" her zaman Europe/Istanbul yerel tarihine göre
+// hesaplanır (sunucu Render'da UTC çalışır, aksi halde gün 03:00'te döner).
+const ISTANBUL_TZ = "Europe/Istanbul";
+function istanbulTodayStr() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: ISTANBUL_TZ });
+}
+// SQL tarafında da aynı gün: (now() AT TIME ZONE 'Europe/Istanbul')::date
+const SQL_ISTANBUL_TODAY = "(now() AT TIME ZONE 'Europe/Istanbul')::date";
+
+// Bir sürücünün "aktif" rotasını seçen ortak yan cümle: bugüne tarihlenmiş
+// rota her zaman kazanır, yoksa eski (tarihsiz) kayıtlara düşülür. Başka
+// güne tarihli satırlar dışarıda bırakılır.
+const ACTIVE_ROUTE_WHERE =
+  `user_id = $1 AND (route_date = ${SQL_ISTANBUL_TODAY} OR route_date IS NULL)`;
+const ACTIVE_ROUTE_ORDER =
+  "ORDER BY (route_date IS NOT NULL) DESC, created_at DESC";
+
 function normalizeRoute(row) {
   const routeJson = parseRouteJson(row.route_json);
   return {
     id: row.id,
     user_id: row.user_id,
     name: row.name,
+    route_date: row.route_date ?? null,
     created_at: row.created_at,
     updated_at: routeJson.updatedAt || routeJson.updated_at || row.created_at,
     status: routeJson.status || "active",
@@ -286,11 +310,12 @@ app.get("/routes/today/summary", authenticateToken, requireRole("admin"), async 
     const driversResult = await pool.query(
       "SELECT id, username FROM users WHERE role = 'driver' OR role IS NULL ORDER BY length(username), username"
     );
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = istanbulTodayStr();
     const summaries = [];
     for (const driver of driversResult.rows) {
       const routeResult = await pool.query(
-        "SELECT route_json, created_at FROM routes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        `SELECT route_json, created_at, route_date FROM routes
+         WHERE ${ACTIVE_ROUTE_WHERE} ${ACTIVE_ROUTE_ORDER} LIMIT 1`,
         [driver.id]
       );
       if (routeResult.rows.length === 0) {
@@ -307,7 +332,11 @@ app.get("/routes/today/summary", authenticateToken, requireRole("admin"), async 
       }
       const row = routeResult.rows[0];
       const routeJson = parseRouteJson(row.route_json);
-      const isToday = new Date(row.created_at).toISOString().slice(0, 10) === todayStr;
+      // route_date dolu satır zaten sorguda bugüne filtrelendi; tarihsiz
+      // (eski) satırlarda created_at gününe bakılır.
+      const isToday = row.route_date != null
+        ? true
+        : new Date(row.created_at).toLocaleDateString("en-CA", { timeZone: ISTANBUL_TZ }) === todayStr;
       const stops = Array.isArray(routeJson.stops)
         ? routeJson.stops
         : Array.isArray(routeJson.addresses)
@@ -375,13 +404,25 @@ app.post("/users/:user_id/fcm-token", authenticateToken, async (req, res) => {
 });
 
 app.post("/routes", authenticateToken, async (req, res) => {
-  const { user_id, name, route_json } = req.body;
+  const { user_id, name, route_json, route_date } = req.body;
   if (!user_id || !route_json) {
     return res.status(400).json({ error: "user_id ve route_json zorunlu" });
   }
   // Bir sürücü sadece kendi adına rota oluşturabilir; başkası adına rota
   // (ve o kişiye giden push bildirimi) sadece admin atayabilir.
   if (!canAccessUser(req, user_id)) return forbidden(res);
+
+  // route_date verilirse (yyyy-MM-dd) o güne ait rota upsert edilir —
+  // takvimden aynı gün için tekrar tekrar senkron edilince satır çoğalmaz,
+  // en güncel hâli geçer. Verilmezse eski davranış (tarihsiz insert).
+  let routeDate = null;
+  if (route_date != null) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(route_date))) {
+      return res.status(400).json({ error: "route_date yyyy-MM-dd formatında olmalı" });
+    }
+    routeDate = String(route_date);
+  }
+
   const now = new Date().toISOString();
   const parsedRouteJson = parseRouteJson(route_json);
   const normalizedRouteJson = {
@@ -391,12 +432,27 @@ app.post("/routes", authenticateToken, async (req, res) => {
     updatedAt: now,
   };
   try {
-    const result = await pool.query(
-      "INSERT INTO routes (id, user_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
-      [user_id, name || "Rota360 Rota", normalizedRouteJson]
-    );
+    const result = routeDate
+      ? await pool.query(
+          `INSERT INTO routes (id, user_id, name, route_json, route_date)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4)
+           ON CONFLICT (user_id, route_date) WHERE route_date IS NOT NULL
+           DO UPDATE SET route_json = EXCLUDED.route_json,
+                         name = EXCLUDED.name,
+                         created_at = NOW()
+           RETURNING *`,
+          [user_id, name || "Rota360 Rota", normalizedRouteJson, routeDate]
+        )
+      : await pool.query(
+          "INSERT INTO routes (id, user_id, name, route_json) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
+          [user_id, name || "Rota360 Rota", normalizedRouteJson]
+        );
 
-    if (messaging) {
+    // İleri tarihli günlerin senkronu sürücüyü bildirime boğmasın: push
+    // yalnızca tarihsiz ya da BUGÜNE ait rota kaydedilince gönderilir.
+    const shouldNotify = !routeDate || routeDate === istanbulTodayStr();
+
+    if (messaging && shouldNotify) {
       try {
         const driverResult = await pool.query(
           "SELECT fcm_token FROM users WHERE id = $1 AND fcm_token IS NOT NULL",
@@ -446,7 +502,7 @@ app.get("/routes/:user_id/active", authenticateToken, async (req, res) => {
   if (!canAccessUser(req, user_id)) return forbidden(res);
   try {
     const result = await pool.query(
-      "SELECT * FROM routes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+      `SELECT * FROM routes WHERE ${ACTIVE_ROUTE_WHERE} ${ACTIVE_ROUTE_ORDER} LIMIT 1`,
       [user_id]
     );
     if (result.rows.length === 0) {
