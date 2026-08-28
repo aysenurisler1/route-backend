@@ -24,8 +24,13 @@ const app = express();
 // davranilir / rate-limit hata verebilir.
 app.set("trust proxy", 1);
 
-// ── CORS: production domain'leri (CORS_ORIGIN env değişkeninden, virgülle ayrılmış)
-// + geliştirme sırasında HER localhost portuna otomatik izin verir ─────────
+const isProduction = process.env.NODE_ENV === "production";
+
+// ── CORS: production domain'leri CORS_ORIGIN env değişkeninden (virgülle
+// ayrılmış) gelir. Geliştirme sırasında (NODE_ENV !== "production") HER
+// localhost/127.0.0.1 portuna da otomatik izin verilir — flutter run -d
+// chrome her seferinde port değiştiriyor. Production'da localhost regex'i
+// devre dışıdır; yalnızca CORS_ORIGIN listesindeki origin'ler geçer.
 const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
   : [];
@@ -36,9 +41,9 @@ app.use(cors({
     if (!origin) return callback(null, true);
     // production listesinde varsa izin ver
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    // herhangi bir localhost portu ise izin ver (flutter run -d chrome her seferinde port değiştiriyor)
-    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
-    if (/^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
+    // sadece geliştirmede: herhangi bir localhost portu
+    if (!isProduction && /^http:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
+    if (!isProduction && /^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
     return callback(new Error("CORS engellendi: " + origin));
   },
   credentials: true,
@@ -307,51 +312,53 @@ app.get("/users/drivers", authenticateToken, requireRole("admin"), async (req, r
 // için — sürücü sayısı kadar ayrı /routes/:id/active çağrısı yapmak yerine.
 app.get("/routes/today/summary", authenticateToken, requireRole("admin"), async (req, res) => {
   try {
-    const driversResult = await pool.query(
-      "SELECT id, username FROM users WHERE role = 'driver' OR role IS NULL ORDER BY length(username), username"
-    );
     const todayStr = istanbulTodayStr();
-    const summaries = [];
-    for (const driver of driversResult.rows) {
-      const routeResult = await pool.query(
-        `SELECT route_json, created_at, route_date FROM routes
-         WHERE ${ACTIVE_ROUTE_WHERE} ${ACTIVE_ROUTE_ORDER} LIMIT 1`,
-        [driver.id]
-      );
-      if (routeResult.rows.length === 0) {
-        summaries.push({
-          userId: driver.id,
-          username: driver.username,
-          hasRouteToday: false,
-          totalStops: 0,
-          completedStops: 0,
-          totalKm: 0,
-          totalMin: 0,
-        });
-        continue;
-      }
-      const row = routeResult.rows[0];
+    // Tek sorgu: her sürücü + o sürücünün "aktif" rotası. DISTINCT ON ile
+    // sürücü başına tek satır seçilir; bugüne tarihli rota tarihsiz olana
+    // yeğ tutulur (route_date IS NOT NULL DESC), sonra en yeni created_at.
+    // Rotası olmayan sürücü LEFT JOIN'den NULL route_json ile döner.
+    // Eskiden burada sürücü sayısı kadar ayrı SELECT vardı (N+1).
+    const { rows } = await pool.query(
+      `SELECT sub.user_id, sub.username, sub.route_json, sub.created_at, sub.route_date
+       FROM (
+         SELECT DISTINCT ON (u.id)
+           u.id AS user_id, u.username,
+           r.route_json, r.created_at, r.route_date
+         FROM users u
+         LEFT JOIN routes r
+           ON r.user_id = u.id
+          AND (r.route_date = ${SQL_ISTANBUL_TODAY} OR r.route_date IS NULL)
+         WHERE u.role = 'driver' OR u.role IS NULL
+         ORDER BY u.id, (r.route_date IS NOT NULL) DESC, r.created_at DESC
+       ) sub
+       ORDER BY length(sub.username), sub.username`
+    );
+
+    const summaries = rows.map((row) => {
       const routeJson = parseRouteJson(row.route_json);
-      // route_date dolu satır zaten sorguda bugüne filtrelendi; tarihsiz
-      // (eski) satırlarda created_at gününe bakılır.
-      const isToday = row.route_date != null
-        ? true
-        : new Date(row.created_at).toLocaleDateString("en-CA", { timeZone: ISTANBUL_TZ }) === todayStr;
       const stops = Array.isArray(routeJson.stops)
         ? routeJson.stops
         : Array.isArray(routeJson.addresses)
           ? routeJson.addresses
           : [];
-      summaries.push({
-        userId: driver.id,
-        username: driver.username,
+      // route_date dolu satır zaten sorguda bugüne filtrelendi; tarihsiz
+      // (eski) satırlarda created_at gününe bakılır. Hiç rota yoksa
+      // created_at null → bugün değil.
+      const isToday = row.route_date != null
+        ? true
+        : row.created_at != null &&
+          new Date(row.created_at).toLocaleDateString("en-CA", { timeZone: ISTANBUL_TZ }) === todayStr;
+      return {
+        userId: row.user_id,
+        username: row.username,
         hasRouteToday: isToday && stops.length > 0,
         totalStops: stops.length,
         completedStops: stops.filter((s) => s.completed).length,
         totalKm: routeJson.totalKm ?? 0,
         totalMin: routeJson.totalMin ?? 0,
-      });
-    }
+      };
+    });
+
     res.json(summaries);
   } catch (err) {
     console.log(err);
@@ -431,6 +438,55 @@ app.post("/routes", authenticateToken, async (req, res) => {
     createdAt: parsedRouteJson.createdAt || now,
     updatedAt: now,
   };
+
+  // Bu güne ait rota zaten varsa (takvimden yeniden senkron), sürücünün
+  // işaretlediği "tamamlandı" ve eklediği saha notları KORUNMALI — aksi
+  // halde panelden her düzenleme (ör. öğle duraklarını girmek) sürücünün
+  // sabah ilerlemesini sıfırlıyordu. Duraklar konum + vardiya + rol
+  // (start/midday/end) ile eşleştirilir; ev düğümleri aynı koordinatta
+  // olduğundan sıraya göre çözülür.
+  if (routeDate && Array.isArray(normalizedRouteJson.stops)) {
+    try {
+      const existing = await pool.query(
+        "SELECT route_json FROM routes WHERE user_id = $1 AND route_date = $2",
+        [user_id, routeDate]
+      );
+      const oldStops = existing.rows.length
+        ? parseRouteJson(existing.rows[0].route_json).stops
+        : null;
+      if (Array.isArray(oldStops) && oldStops.length) {
+        const keyOf = (s) => {
+          const lat = Number(s.latitude);
+          const lng = Number(s.longitude);
+          const geo =
+            Number.isFinite(lat) && Number.isFinite(lng)
+              ? `${lat.toFixed(5)},${lng.toFixed(5)}`
+              : String(s.address || s.street || "");
+          return `${s.shift ?? ""}|${s.midday ? "m" : ""}|${geo}`;
+        };
+        const carry = new Map();
+        for (const s of oldStops) {
+          const k = keyOf(s);
+          if (!carry.has(k)) carry.set(k, []);
+          carry.get(k).push({ completed: !!s.completed, notes: s.notes });
+        }
+        for (const s of normalizedRouteJson.stops) {
+          const bucket = carry.get(keyOf(s));
+          if (bucket && bucket.length) {
+            const prev = bucket.shift();
+            if (prev.completed) s.completed = true;
+            if ((s.notes == null || s.notes === "") && prev.notes) {
+              s.notes = prev.notes;
+            }
+          }
+        }
+      }
+    } catch (mergeErr) {
+      console.log("Rota birleştirme hatası (yok sayıldı):", mergeErr.message);
+      if (process.env.SENTRY_DSN) Sentry.captureException(mergeErr);
+    }
+  }
+
   try {
     const result = routeDate
       ? await pool.query(
