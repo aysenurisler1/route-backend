@@ -24,13 +24,10 @@ const app = express();
 // davranilir / rate-limit hata verebilir.
 app.set("trust proxy", 1);
 
-const isProduction = process.env.NODE_ENV === "production";
-
-// ── CORS: production domain'leri CORS_ORIGIN env değişkeninden (virgülle
-// ayrılmış) gelir. Geliştirme sırasında (NODE_ENV !== "production") HER
-// localhost/127.0.0.1 portuna da otomatik izin verilir — flutter run -d
-// chrome her seferinde port değiştiriyor. Production'da localhost regex'i
-// devre dışıdır; yalnızca CORS_ORIGIN listesindeki origin'ler geçer.
+// ── CORS: production domain'leri (CORS_ORIGIN env değişkeninden, virgülle ayrılmış)
+// + HER localhost/127.0.0.1 portuna otomatik izin verir — flutter run -d
+// chrome her seferinde port değiştiriyor, web paneli/mobil-web önizlemesi
+// production backend'ine buradan bağlanıyor.
 const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
   : [];
@@ -41,9 +38,9 @@ app.use(cors({
     if (!origin) return callback(null, true);
     // production listesinde varsa izin ver
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    // sadece geliştirmede: herhangi bir localhost portu
-    if (!isProduction && /^http:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
-    if (!isProduction && /^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
+    // herhangi bir localhost portu ise izin ver
+    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
+    if (/^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
     return callback(new Error("CORS engellendi: " + origin));
   },
   credentials: true,
