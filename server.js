@@ -784,27 +784,80 @@ app.patch("/routes/:route_id/stops", authenticateToken, async (req, res) => {
         ? routeJson.addresses
         : [];
 
-    // newOrder'daki id→order eşleşmesini uygula; bilinmeyen id'ler görmezden geliniyor.
-    const orderMap = {};
-    newOrder.forEach((s) => {
-      if (s.id != null) orderMap[String(s.id)] = s.order;
-    });
+    // Mobil, durakların TAMAMINI istenen sırada gönderir. Eşleştirme
+    // sırası: (1) id/code — varsa; (2) konum (lat/lng ~5 ondalık) — takvim
+    // senkronundan gelen duraklarda id/code yok, ama koordinat hep var;
+    // (3) pozisyon — son çare. Eskiden yalnızca (1) vardı ve id/code'suz
+    // rotalarda PATCH sessizce hiçbir şey yapmadan 200 dönüyordu; sürücü
+    // sürüklemesi local'de görünüp ~10sn sonraki senkronda geri gidiyordu.
+    if (newOrder.length !== currentStops.length) {
+      return res.status(409).json({
+        error: `Durak sayısı uyuşmuyor (rota: ${currentStops.length}, gelen: ${newOrder.length})`,
+      });
+    }
 
-    const updatedStops = currentStops
-      .map((stop) => {
-        const key = String(stop.id ?? stop.code ?? "");
-        return key && orderMap[key] != null
-          ? { ...stop, order: orderMap[key] }
-          : stop;
-      })
-      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const norm = (v) => (v == null ? "" : String(v).trim());
+    const geoKey = (s) => {
+      const la = Number(s.latitude ?? s.lat);
+      const ln = Number(s.longitude ?? s.lng ?? s.lon);
+      return Number.isFinite(la) && Number.isFinite(ln)
+        ? `${la.toFixed(5)},${ln.toFixed(5)}`
+        : "";
+    };
+    const used = new Array(currentStops.length).fill(false);
+    const matchIndex = (incoming, pos) => {
+      const inId = norm(incoming.id);
+      const inCode = norm(incoming.code);
+      if (inId || inCode) {
+        for (let i = 0; i < currentStops.length; i++) {
+          if (used[i]) continue;
+          const s = currentStops[i];
+          if (inId && (norm(s.id) === inId || norm(s.code) === inId)) return i;
+          if (inCode && norm(s.code) === inCode) return i;
+        }
+      }
+      const gk = geoKey(incoming);
+      if (gk) {
+        for (let i = 0; i < currentStops.length; i++) {
+          if (!used[i] && geoKey(currentStops[i]) === gk) return i;
+        }
+      }
+      if (!used[pos]) return pos;
+      for (let i = 0; i < currentStops.length; i++) if (!used[i]) return i;
+      return -1;
+    };
+
+    let matched = 0;
+    const updatedStops = [];
+    for (let k = 0; k < newOrder.length; k++) {
+      const mi = matchIndex(newOrder[k], k);
+      if (mi === -1) {
+        return res.status(409).json({ error: "Duraklar eşleştirilemedi" });
+      }
+      if (
+        norm(newOrder[k].id) &&
+        (norm(currentStops[mi].id) === norm(newOrder[k].id) ||
+          norm(currentStops[mi].code) === norm(newOrder[k].id))
+      ) {
+        matched++;
+      } else if (geoKey(newOrder[k]) && geoKey(currentStops[mi]) === geoKey(newOrder[k])) {
+        matched++;
+      }
+      used[mi] = true;
+      updatedStops.push({ ...currentStops[mi], order: k + 1 });
+    }
 
     const updatedRouteJson = { ...routeJson, stops: updatedStops, updatedAt: new Date().toISOString() };
     const updateResult = await pool.query(
       "UPDATE routes SET route_json = $1 WHERE id = $2 RETURNING *",
       [updatedRouteJson, route_id]
     );
-    res.json({ message: "Durak sırası güncellendi", route: normalizeRoute(updateResult.rows[0]) });
+    res.json({
+      message: "Durak sırası güncellendi",
+      matched,
+      total: currentStops.length,
+      route: normalizeRoute(updateResult.rows[0]),
+    });
   } catch (err) {
     console.log(err);
     if (process.env.SENTRY_DSN) Sentry.captureException(err);
